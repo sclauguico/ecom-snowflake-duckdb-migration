@@ -1,6 +1,6 @@
 services:
   db:
-    container_name: postgres_cont
+    container_name: postgres_container
     image: postgres
     restart: always
     environment:
@@ -15,7 +15,7 @@ services:
       - ecommerce-modern-data-stack_4b35e1_airflow
 
   pgadmin:
-    container_name: pgadmin4_cont
+    container_name: pgadmin4_container
     image: dpage/pgadmin4
     restart: always
 
