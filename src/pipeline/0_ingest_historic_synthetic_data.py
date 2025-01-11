@@ -4,8 +4,6 @@ import boto3
 import json
 from sqlalchemy import create_engine
 from dotenv import load_dotenv
-import snowflake.connector
-from snowflake.connector.pandas_tools import write_pandas
 import psycopg2
 import tempfile
 from pandas import json_normalize
@@ -21,7 +19,6 @@ class InitialHistoricETL:
         # Initialize connections
         self._init_postgres()
         self._init_s3()
-        self._init_snowflake()
         
         # Define source mappings
         self.postgres_tables = ['categories', 'subcategories', 'order_items', 'interactions']
@@ -46,31 +43,6 @@ class InitialHistoricETL:
         self.s3_client = boto3.client('s3', **s3_credentials)
         self.historic_bucket = os.getenv('AWS_S3_HISTORIC_SYNTH')
         self.latest_bucket = os.getenv('AWS_S3_LATEST_SYNTH')
-
-    def _init_snowflake(self):
-        """Initialize Snowflake connection"""
-        try:
-            self.snow_conn = snowflake.connector.connect(
-                user=os.getenv('SNOWFLAKE_USER'),
-                password=os.getenv('SNOWFLAKE_PASSWORD'),
-                account=os.getenv('SNOWFLAKE_ACCOUNT'),
-                warehouse=os.getenv('SNOWFLAKE_WAREHOUSE'),
-                role=os.getenv('SNOWFLAKE_ROLE')
-            )
-            
-            self.snow_cursor = self.snow_conn.cursor()
-            
-            # Setup database and schema
-            for cmd in [
-                f"USE WAREHOUSE {os.getenv('SNOWFLAKE_WAREHOUSE')}",
-                f"USE DATABASE {os.getenv('SNOWFLAKE_DATABASE')}",
-                f"USE SCHEMA {os.getenv('SNOWFLAKE_RAW_SCHEMA')}"
-            ]:
-                self.snow_cursor.execute(cmd)
-                
-        except Exception as e:
-            print(f"Snowflake initialization error: {str(e)}")
-            raise
 
     def extract_from_postgres(self, table_name, data_source):
         """Extract data from PostgreSQL"""
@@ -101,14 +73,14 @@ class InitialHistoricETL:
     def get_primary_keys(self, table_name):
         """Return primary key columns for each table"""
         pk_mapping = {
-            'customers': ['CUSTOMER_ID'],
-            'orders': ['ORDER_ID'],
-            'products': ['PRODUCT_ID'],
-            'order_items': ['ORDER_ITEM_ID'],
-            'categories': ['CATEGORY_ID'],
-            'subcategories': ['SUBCATEGORY_ID'],
-            'reviews': ['REVIEW_ID'],
-            'interactions': ['EVENT_ID']
+            'customers': ['customer_id'],
+            'orders': ['order_id'],
+            'products': ['product_id'],
+            'order_items': ['order_item_id'],
+            'categories': ['category_id'],
+            'subcategories': ['subcategory_id'],
+            'reviews': ['review_id'],
+            'interactions': ['event_id']
         }
         return pk_mapping.get(table_name.replace('latest_', ''), ['id'])
 
@@ -146,9 +118,9 @@ class InitialHistoricETL:
             df = self.flatten_json_df(df, table_name)
             
             # Add metadata columns
-            df['DATA_SOURCE'] = 'historic'
-            df['BATCH_ID'] = self.batch_id
-            df['LOADED_AT'] = self.batch_timestamp
+            df['data_source'] = 'historic'
+            df['batch_id'] = self.batch_id
+            df['loaded_at'] = self.batch_timestamp
             
             # Standard transformations
             for col in df.select_dtypes(include=['datetime64']).columns:
@@ -156,8 +128,6 @@ class InitialHistoricETL:
             
             df = df.replace({pd.NA: None, pd.NaT: None})
             
-            # Convert column names to uppercase for Snowflake
-            df.columns = [col.upper() for col in df.columns]
             df = self.remove_duplicate_primary_keys(df, table_name)
             
             return df
@@ -227,52 +197,6 @@ class InitialHistoricETL:
             
         except Exception as e:
             print(f"Error saving to S3 historic bucket: {str(e)}")
-            raise
-
-    def load_to_snowflake(self, df, table_name):
-        """Load data to Snowflake"""
-        try:
-            database = os.getenv('SNOWFLAKE_DATABASE')
-            schema = os.getenv('SNOWFLAKE_RAW_SCHEMA')
-            full_table_name = f"{database}.{schema}.{table_name.upper()}"
-            
-            # Create table if not exists
-            column_definitions = []
-            for col_name, dtype in df.dtypes.items():
-                sf_type = "VARCHAR"
-                if pd.api.types.is_integer_dtype(dtype):
-                    sf_type = "NUMBER"
-                elif pd.api.types.is_float_dtype(dtype):
-                    sf_type = "FLOAT"
-                elif pd.api.types.is_datetime64_any_dtype(dtype):
-                    sf_type = "TIMESTAMP"
-                column_definitions.append(f'"{col_name.upper()}" {sf_type}')
-
-            create_table_sql = f"""
-            CREATE TABLE IF NOT EXISTS {full_table_name} (
-                {', '.join(column_definitions)}
-            )
-            """
-            
-            self.snow_cursor.execute(create_table_sql)
-            
-            # Write data
-            success, num_chunks, num_rows, _ = write_pandas(
-                conn=self.snow_conn,
-                df=df,
-                table_name=table_name.upper(),
-                database=database,
-                schema=schema,
-                quote_identifiers=False
-            )
-
-            if not success:
-                raise Exception(f"Failed to load {table_name} to Snowflake")
-
-            print(f"Successfully loaded {num_rows} rows to {full_table_name}")
-
-        except Exception as e:
-            print(f"Error loading to Snowflake: {str(e)}")
             raise
 
     def find_valid_date_column(self, df, table_name):
@@ -358,9 +282,6 @@ class InitialHistoricETL:
                     # Save to S3 as historic data
                     self.save_to_s3_historic(transformed_df, table, metadata)
                     
-                    # Load to Snowflake
-                    self.load_to_snowflake(transformed_df, table)
-                    
                     print(f"""
                     Completed processing for {table}:
                     - Historic records: {len(historic_df)}
@@ -369,7 +290,6 @@ class InitialHistoricETL:
                     - Date column used: {date_column if date_column else 'None'}
                     - Data saved locally to: {combined_path}
                     - Data saved to S3 historic bucket
-                    - Data loaded to Snowflake table: {table.upper()}
                     """)
 
                 except Exception as e:
@@ -380,8 +300,6 @@ class InitialHistoricETL:
             print(f"Initial load process error: {str(e)}")
             raise
         finally:
-            self.snow_cursor.close()
-            self.snow_conn.close()
             print("\nInitial historic data load completed. Connections closed.")
 
 if __name__ == "__main__":
