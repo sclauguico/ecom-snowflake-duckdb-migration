@@ -11,4 +11,7 @@ airflow.cfg
 airflow.db
 venv/
 img/
+generated_historic_data/
+generated_latest_data/
+ingested_data/
 de-ecommerce.png
