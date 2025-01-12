@@ -73,14 +73,14 @@ class InitialHistoricETL:
     def get_primary_keys(self, table_name):
         """Return primary key columns for each table"""
         pk_mapping = {
-            'customers': ['customer_id'],
-            'orders': ['order_id'],
-            'products': ['product_id'],
-            'order_items': ['order_item_id'],
-            'categories': ['category_id'],
-            'subcategories': ['subcategory_id'],
-            'reviews': ['review_id'],
-            'interactions': ['event_id']
+            'customers': ['CUSTOMER_ID'],
+            'orders': ['ORDER_ID'],
+            'products': ['PRODUCT_ID'],
+            'order_items': ['ORDER_ITEM_ID'],
+            'categories': ['CATEGORY_ID'],
+            'subcategories': ['SUBCATEGORY_ID'],
+            'reviews': ['REVIEW_ID'],
+            'interactions': ['EVENT_ID']
         }
         return pk_mapping.get(table_name.replace('latest_', ''), ['id'])
 
@@ -118,9 +118,9 @@ class InitialHistoricETL:
             df = self.flatten_json_df(df, table_name)
             
             # Add metadata columns
-            df['data_source'] = 'historic'
-            df['batch_id'] = self.batch_id
-            df['loaded_at'] = self.batch_timestamp
+            df['DATA_SOURCE'] = 'historic'
+            df['BATCH_ID'] = self.batch_id
+            df['LOADED_AT'] = self.batch_timestamp
             
             # Standard transformations
             for col in df.select_dtypes(include=['datetime64']).columns:
@@ -128,6 +128,8 @@ class InitialHistoricETL:
             
             df = df.replace({pd.NA: None, pd.NaT: None})
             
+            # Convert column names to uppercase for DuckDB
+            df.columns = [col.upper() for col in df.columns]
             df = self.remove_duplicate_primary_keys(df, table_name)
             
             return df
@@ -281,6 +283,7 @@ class InitialHistoricETL:
                     
                     # Save to S3 as historic data
                     self.save_to_s3_historic(transformed_df, table, metadata)
+                    
                     
                     print(f"""
                     Completed processing for {table}:

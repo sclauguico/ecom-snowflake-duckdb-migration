@@ -1,251 +1,396 @@
 import os
 import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-import random
-from faker import Faker
+import boto3
+import json
+from sqlalchemy import create_engine
+from dotenv import load_dotenv
+import psycopg2
+import tempfile
+from pandas import json_normalize
+from datetime import datetime
+import uuid
+import io
 import duckdb
-from pathlib import Path
-from typing import Dict, Any
 
-class EcommerceDataLoader:
-    def __init__(self, db_path: str = "ecommerce.duckdb"):
-        """Initialize DuckDB connection"""
-        self.db_path = db_path
-        self.conn = duckdb.connect(db_path)
-        self._init_database()
+load_dotenv()
 
-    def _init_database(self):
-        """Initialize database schema"""
-        # Create schemas if they don't exist
-        self.conn.execute("CREATE SCHEMA IF NOT EXISTS raw")
-        self.conn.execute("CREATE SCHEMA IF NOT EXISTS staging")
+class IncrementalETL:
+    def __init__(self, motherduck_token=None):
+        # Initialize connections
+        self._init_postgres()
+        self._init_s3()
+        self._init_motherduck(motherduck_token)
         
-        # Create all required tables with appropriate data types
-        tables_schema = {
-            'customers': """
-                CREATE TABLE IF NOT EXISTS raw.customers (
-                    customer_id BIGINT PRIMARY KEY,
-                    email VARCHAR,
-                    first_name VARCHAR,
-                    last_name VARCHAR,
-                    age INTEGER,
-                    gender VARCHAR,
-                    annual_income DOUBLE,
-                    marital_status VARCHAR,
-                    education VARCHAR,
-                    location_type VARCHAR,
-                    city VARCHAR,
-                    state VARCHAR,
-                    country VARCHAR,
-                    signup_date TIMESTAMP,
-                    last_login TIMESTAMP,
-                    preferred_channel VARCHAR,
-                    is_active BOOLEAN,
-                    created_at TIMESTAMP
-                )
-            """,
-            'products': """
-                CREATE TABLE IF NOT EXISTS raw.products (
-                    product_id BIGINT PRIMARY KEY,
-                    category_id BIGINT,
-                    subcategory_id BIGINT,
-                    product_name VARCHAR,
-                    description VARCHAR,
-                    base_price DOUBLE,
-                    sale_price DOUBLE,
-                    stock_quantity INTEGER,
-                    weight_kg DOUBLE,
-                    is_active BOOLEAN,
-                    created_at TIMESTAMP,
-                    brand VARCHAR,
-                    sku VARCHAR,
-                    rating DOUBLE,
-                    review_count INTEGER
-                )
-            """,
-            'categories': """
-                CREATE TABLE IF NOT EXISTS raw.categories (
-                    category_id BIGINT PRIMARY KEY,
-                    category_name VARCHAR,
-                    created_at TIMESTAMP
-                )
-            """,
-            'subcategories': """
-                CREATE TABLE IF NOT EXISTS raw.subcategories (
-                    subcategory_id BIGINT PRIMARY KEY,
-                    category_id BIGINT,
-                    subcategory_name VARCHAR,
-                    created_at TIMESTAMP
-                )
-            """,
-            'orders': """
-                CREATE TABLE IF NOT EXISTS raw.orders (
-                    order_id BIGINT PRIMARY KEY,
-                    customer_id BIGINT,
-                    order_date TIMESTAMP,
-                    status VARCHAR,
-                    total_amount DOUBLE,
-                    shipping_cost DOUBLE,
-                    payment_method VARCHAR,
-                    shipping_address VARCHAR,
-                    billing_address VARCHAR,
-                    created_at TIMESTAMP,
-                    updated_at TIMESTAMP
-                )
-            """,
-            'order_items': """
-                CREATE TABLE IF NOT EXISTS raw.order_items (
-                    order_item_id BIGINT PRIMARY KEY,
-                    order_id BIGINT,
-                    product_id BIGINT,
-                    quantity INTEGER,
-                    unit_price DOUBLE,
-                    total_price DOUBLE,
-                    created_at TIMESTAMP
-                )
-            """,
-            'reviews': """
-                CREATE TABLE IF NOT EXISTS raw.reviews (
-                    review_id BIGINT PRIMARY KEY,
-                    product_id BIGINT,
-                    order_id BIGINT,
-                    customer_id BIGINT,
-                    review_score INTEGER,
-                    review_text VARCHAR,
-                    created_at TIMESTAMP
-                )
-            """,
-            'interactions': """
-                CREATE TABLE IF NOT EXISTS raw.interactions (
-                    event_id BIGINT PRIMARY KEY,
-                    customer_id BIGINT,
-                    product_id BIGINT,
-                    event_type VARCHAR,
-                    event_date TIMESTAMP,
-                    device_type VARCHAR,
-                    session_id VARCHAR,
-                    created_at TIMESTAMP
-                )
-            """
+        # Define source mappings
+        self.postgres_tables = ['categories', 'subcategories', 'order_items', 'interactions']
+        self.s3_tables = ['customers', 'products', 'orders', 'reviews']
+        
+        # Track batch information
+        self.batch_id = str(uuid.uuid4())
+        self.batch_timestamp = datetime.now()
+    
+    def _init_postgres(self):
+        """Initialize PostgreSQL connection"""
+        self.pg_conn_string = f"postgresql://{os.getenv('POSTGRES_USER')}:{os.getenv('POSTGRES_PASSWORD')}@{os.getenv('POSTGRES_HOST')}:{os.getenv('POSTGRES_PORT')}/{os.getenv('POSTGRES_DB')}"
+        self.pg_engine = create_engine(self.pg_conn_string)
+
+    def _init_s3(self):
+        """Initialize S3 clients"""
+        s3_credentials = {
+            'aws_access_key_id': os.getenv('AWS_S3_ACCESS_KEY_ID'),
+            'aws_secret_access_key': os.getenv('AWS_S3_SECRET_ACCESS_KEY')
         }
         
-        # Create all tables
-        for table_sql in tables_schema.values():
-            self.conn.execute(table_sql)
+        self.s3_client = boto3.client('s3', **s3_credentials)
+        self.historic_bucket = os.getenv('AWS_S3_HISTORIC_SYNTH')
+        self.latest_bucket = os.getenv('AWS_S3_LATEST_SYNTH')
 
-    def load_data(self, data_dict: Dict[str, pd.DataFrame]):
-        """Load all dataframes into DuckDB tables"""
+    def _init_motherduck(self, token):
+        """Initialize MotherDuck connection"""
         try:
-            # Start transaction
-            self.conn.begin()
+            # Use token from parameter or environment variable
+            md_token = token or os.getenv('MOTHERDUCK_TOKEN')
+            if not md_token:
+                raise ValueError("MotherDuck token not provided")
+
+            # First connect to MotherDuck's root
+            root_connection = f"md:?motherduck_token={md_token}"
+            temp_conn = duckdb.connect(root_connection)
             
-            for table_name, df in data_dict.items():
-                print(f"Loading {table_name}...")
-                
-                # Convert datetime columns to proper format
-                datetime_cols = df.select_dtypes(include=['datetime64']).columns
-                for col in datetime_cols:
-                    df[col] = pd.to_datetime(df[col])
-                
-                # Load data into table
-                self.conn.execute(f"DELETE FROM raw.{table_name}")
-                self.conn.register(f"temp_{table_name}", df)
-                self.conn.execute(f"INSERT INTO raw.{table_name} SELECT * FROM temp_{table_name}")
-                
-                # Get row count
-                count = self.conn.execute(f"SELECT COUNT(*) FROM raw.{table_name}").fetchone()[0]
-                print(f"Loaded {count} rows into {table_name}")
+            # Create database if it doesn't exist
+            temp_conn.execute("CREATE DATABASE IF NOT EXISTS ecommerce")
+            temp_conn.close()
+
+            # Now connect to the ecommerce database
+            connection_string = f"md:ecommerce?motherduck_token={md_token}"
+            self.duck_conn = duckdb.connect(connection_string)
             
-            # Commit transaction
-            self.conn.commit()
-            print("\nAll data loaded successfully!")
+            # Create raw schema if it doesn't exist
+            self.duck_conn.execute("CREATE SCHEMA IF NOT EXISTS raw")
+            
+            print("Successfully connected to MotherDuck")
             
         except Exception as e:
-            # Rollback on error
-            self.conn.rollback()
-            print(f"Error loading data: {str(e)}")
+            print(f"MotherDuck initialization error: {str(e)}")
             raise
-        
-    def export_data(self, output_dir: str = "duckdb_exports"):
-        """Export all tables to CSV files"""
+    
+    def extract_historic_from_s3(self, table_name):
+        """Extract historic data from S3 CSV files"""
         try:
-            # Create output directory
-            output_path = Path(output_dir)
-            output_path.mkdir(parents=True, exist_ok=True)
+            # Get CSV file from historic bucket
+            response = self.s3_client.get_object(
+                Bucket=self.historic_bucket,
+                Key=f'csv/{table_name}.csv'
+            )
             
-            # Get all tables
-            tables = self.conn.execute("""
-                SELECT table_name 
-                FROM information_schema.tables 
-                WHERE table_schema = 'raw'
-            """).fetchall()
+            # Read CSV content
+            csv_content = response['Body'].read().decode('utf-8')
+            return pd.read_csv(io.StringIO(csv_content))
             
-            # Export each table
-            for (table_name,) in tables:
-                output_file = output_path / f"{table_name}.csv"
-                self.conn.execute(f"""
-                    COPY (SELECT * FROM raw.{table_name}) 
-                    TO '{output_file}' (HEADER, DELIMITER ',')
-                """)
-                print(f"Exported {table_name} to {output_file}")
-                
         except Exception as e:
-            print(f"Error exporting data: {str(e)}")
+            print(f"Historic S3 extraction error for {table_name}: {str(e)}")
             raise
-    
-    def close(self):
-        """Close the database connection"""
-        self.conn.close()
 
-def save_data(data_dict: Dict[str, pd.DataFrame], db_path: str = "ecommerce.duckdb"):
-    """Save all generated data to DuckDB"""
-    try:
-        # Initialize loader
-        loader = EcommerceDataLoader(db_path)
-        
-        # Load all data
-        loader.load_data(data_dict)
-        
-        # Export data to CSV files
-        loader.export_data()
-        
-        # Close connection
-        loader.close()
-        
-        print("\nData Generation and Loading Summary:")
-        for table_name, df in data_dict.items():
-            print(f"\n{table_name.upper()} Table:")
-            print(f"Total records: {len(df)}")
-            
-            # Different tables have different date columns
-            date_columns = {
-                'customers': 'signup_date',
-                'products': 'created_at',
-                'orders': 'order_date',
-                'order_items': 'created_at',
-                'reviews': 'created_at',
-                'interactions': 'event_date',
-                'categories': 'created_at',
-                'subcategories': 'created_at'
-            }
-            
-            # Get the appropriate date column for this table
-            date_col = date_columns.get(table_name)
-            if date_col and date_col in df.columns:
-                print(f"Date range: {df[date_col].min()} to {df[date_col].max()}")
-    
-    except Exception as e:
-        print(f"Error saving data: {str(e)}")
-        raise
+    def extract_latest_from_postgres(self, table_name):
+        """Extract latest data from PostgreSQL"""
+        try:
+            query = f"SELECT * FROM latest_{table_name}"
+            df = pd.read_sql(query, self.pg_engine)
+            return df
+        except Exception as e:
+            print(f"PostgreSQL extraction error for {table_name}: {str(e)}")
+            raise
 
-# Example usage
+    def extract_latest_from_s3(self, table_name):
+        """Extract latest data from S3"""
+        try:
+            response = self.s3_client.get_object(
+                Bucket=self.latest_bucket,
+                Key=f'json/{table_name}.json'
+            )
+            
+            json_content = json.loads(response['Body'].read().decode('utf-8'))
+            return pd.DataFrame(json_content['data'])
+        except Exception as e:
+            print(f"Latest S3 extraction error for {table_name}: {str(e)}")
+            raise
+    def get_primary_keys(self, table_name):
+        """Return primary key columns for each table"""
+        pk_mapping = {
+            'customers': ['CUSTOMER_ID'],
+            'orders': ['ORDER_ID'],
+            'products': ['PRODUCT_ID'],
+            'order_items': ['ORDER_ITEM_ID'],
+            'categories': ['CATEGORY_ID'],
+            'subcategories': ['SUBCATEGORY_ID'],
+            'reviews': ['REVIEW_ID'],
+            'interactions': ['EVENT_ID']
+        }
+        return pk_mapping.get(table_name.replace('latest_', ''), ['id'])
+
+    def remove_duplicate_primary_keys(self, df, table_name):
+        """Remove rows with duplicate primary keys, defaulting to the first column if necessary."""
+        try:
+            # Get primary keys for the table
+            primary_keys = self.get_primary_keys(table_name)
+
+            if not primary_keys:
+                print(f"Warning: No primary keys found or defined for {table_name}. Skipping deduplication.")
+                return df
+
+            # Ensure all primary keys exist in the DataFrame
+            missing_keys = [key for key in primary_keys if key not in df.columns]
+            if missing_keys:
+                print(f"Error: Missing primary keys {missing_keys} in table {table_name}.")
+                return df
+
+            # Deduplicate based on primary keys
+            if "LOADED_AT" in df.columns:
+                df = df.sort_values(by="LOADED_AT", ascending=False)
+            else:
+                print(f"Warning: No valid date column found for {table_name}. Proceeding without sorting.")
+            df = df.drop_duplicates(subset=primary_keys, keep="first")
+            return df
+        except Exception as e:
+            print(f"Error removing duplicate primary keys for {table_name}: {str(e)}")
+            raise
+        
+    def transform_data(self, df, table_name):
+        """Transform data with enhanced column handling and debugging"""
+        try:
+            print(f"\nDETAILED COLUMN ANALYSIS FOR {table_name}")
+            print("=" * 50)
+            
+            # Print initial column state
+            print("Initial columns with types:")
+            for col in df.columns:
+                print(f"- {col}: {df[col].dtype}")
+            
+            # Handle datetime columns before any other transformations
+            date_columns = df.select_dtypes(include=['datetime64']).columns
+            for col in date_columns:
+                # Convert to pandas datetime with error handling
+                try:
+                    df[col] = pd.to_datetime(df[col], errors='coerce')
+                    # Convert to string format
+                    df[col] = df[col].dt.strftime('%Y-%m-%d %H:%M:%S')
+                except Exception as e:
+                    print(f"Warning: Error converting datetime column {col}: {str(e)}")
+                    # If conversion fails, keep original values
+                    continue
+                
+            # Check for and handle duplicate columns
+            duplicate_cols = df.columns[df.columns.duplicated(keep=False)]
+            if len(duplicate_cols) > 0:
+                print("\nFound duplicate columns:")
+                for col in duplicate_cols:
+                    print(f"- {col}")
+                    
+                # Create a mapping of duplicate columns to their first occurrence
+                col_mapping = {}
+                for col in df.columns:
+                    if col in duplicate_cols:
+                        if col not in col_mapping:
+                            col_mapping[col] = f"{col}_1"
+                        else:
+                            count = len([k for k in col_mapping.values() if k.startswith(col)]) + 1
+                            col_mapping[col] = f"{col}_{count}"
+                    else:
+                        col_mapping[col] = col
+                        
+                # Rename columns using the mapping
+                df.columns = [col_mapping[col] for col in df.columns]
+                
+                print("\nRenamed duplicate columns:")
+                for old_col, new_col in col_mapping.items():
+                    if old_col in duplicate_cols:
+                        print(f"- {old_col} -> {new_col}")
+            
+            # Flatten JSON if needed
+            df = self.flatten_json_df(df, table_name)
+            
+            # Add metadata columns
+            df['DATA_SOURCE'] = 'historic'
+            df['BATCH_ID'] = self.batch_id
+            df['LOADED_AT'] = self.batch_timestamp
+            
+            # Handle NA/NaT values
+            df = df.replace({pd.NA: None, pd.NaT: None})
+            
+            # Convert column names to uppercase
+            df.columns = [col.upper() for col in df.columns]
+            df = self.remove_duplicate_primary_keys(df, table_name)
+            print("\nFinal columns:")
+            print(df.columns.tolist())
+            
+            # Verify no duplicates remain
+            if df.columns.duplicated().any():
+                duplicates = df.columns[df.columns.duplicated()].tolist()
+                raise Exception(f"Duplicate columns still exist after transformation: {duplicates}")
+            
+            return df
+            
+        except Exception as e:
+            print(f"Transform error for {table_name}: {str(e)}")
+            print("Full column list at error:")
+            print(df.columns.tolist())
+            raise
+
+
+    def flatten_json_df(self, df, table_name):
+        """Flatten nested JSON structures"""
+        try:
+            json_columns = [
+                col for col in df.columns 
+                if df[col].dtype == 'object' and 
+                isinstance(df[col].dropna().iloc[0] if not df[col].isna().all() else None, (dict, list))
+            ]
+            
+            if not json_columns:
+                return df
+
+            flat_df = df.copy()
+            
+            for col in json_columns:
+                try:
+                    if isinstance(df[col].dropna().iloc[0], dict):
+                        flattened = pd.json_normalize(df[col].dropna(), sep='_')
+                        flat_df = flat_df.drop(columns=[col])
+                        for new_col in flattened.columns:
+                            flat_df[f"{col}_{new_col}"] = flattened[new_col]
+                    elif isinstance(df[col].dropna().iloc[0], list):
+                        flat_df[col] = df[col].apply(lambda x: json.dumps(x) if isinstance(x, list) else x)
+                except Exception as e:
+                    print(f"Warning: Could not flatten column {col}: {str(e)}")
+                    continue
+            
+            return flat_df
+        except Exception as e:
+            print(f"JSON flattening error for {table_name}: {str(e)}")
+            raise
+
+    def save_to_s3_historic(self, df, table_name, metadata):
+        """Save transformed data and metadata to S3 historic bucket"""
+        try:
+            # Save as CSV
+            csv_buffer = io.StringIO()
+            df.to_csv(csv_buffer, index=False)
+            
+            # Save to historic data folder
+            self.s3_client.put_object(
+                Bucket=self.historic_bucket,
+                Key=f'csv/{table_name}.csv',
+                Body=csv_buffer.getvalue().encode('utf-8')
+            )
+            
+            # Save metadata
+            self.s3_client.put_object(
+                Bucket=self.historic_bucket,
+                Key=f'csv/{table_name}_metadata.json',
+                Body=json.dumps(metadata, default=str)
+            )
+            
+            print(f"Successfully saved {table_name} to historic bucket as CSV with metadata")
+            
+        except Exception as e:
+            print(f"Error saving to S3 historic bucket: {str(e)}")
+            raise
+        
+    def load_to_motherduck(self, df, table_name):
+        """Load data to MotherDuck with proper handling of duplicates and updates"""
+        try:
+            full_table_name = f"raw.{table_name.lower()}"
+            temp_table_name = f"raw.temp_{table_name.lower()}"
+            
+            # Get primary keys
+            primary_keys = [pk.upper() for pk in self.get_primary_keys(table_name)]
+            
+            # Create temporary table and load data
+            self.duck_conn.execute(f"DROP TABLE IF EXISTS {temp_table_name}")
+            self.duck_conn.execute(f"CREATE TABLE {temp_table_name} AS SELECT * FROM df")
+            
+            # Create target table if it doesn't exist
+            self.duck_conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {full_table_name} AS 
+                SELECT * FROM {temp_table_name} WHERE 1=0
+            """)
+            
+            # Construct MERGE equivalent using DELETE + INSERT
+            delete_condition = " AND ".join([
+                f"{full_table_name}.{pk} IN (SELECT {pk} FROM {temp_table_name})"
+                for pk in primary_keys
+            ])
+            
+            self.duck_conn.execute(f"""
+                DELETE FROM {full_table_name}
+                WHERE {delete_condition}
+            """)
+            
+            # Insert new records
+            self.duck_conn.execute(f"""
+                INSERT INTO {full_table_name}
+                SELECT * FROM {temp_table_name}
+            """)
+            
+            # Get stats
+            row_count = self.duck_conn.execute(f"""
+                SELECT COUNT(*) FROM {full_table_name}
+            """).fetchone()[0]
+            
+            # Clean up
+            self.duck_conn.execute(f"DROP TABLE IF EXISTS {temp_table_name}")
+            
+            print(f"""Successfully loaded data to {full_table_name}:
+            - Rows in table: {row_count}
+            - Using primary keys: {', '.join(primary_keys)}""")
+            
+        except Exception as e:
+            print(f"Error loading to MotherDuck: {str(e)}")
+            raise
+
+    def run_etl(self):
+        """Execute ETL process"""
+        try:
+            print("\nStarting ETL process...")
+            
+            for table in self.postgres_tables + self.s3_tables:
+                print(f"\nProcessing {table}")
+                
+                try:
+                    # Extract historic data from S3 CSV
+                    historic_df = self.extract_historic_from_s3(table)
+                    
+                    # Extract latest data from original sources
+                    latest_df = (self.extract_latest_from_s3(table) 
+                               if table in self.s3_tables 
+                               else self.extract_latest_from_postgres(table))
+                    
+                    # Transform data
+                    combined_df = self.transform_data(
+                        pd.concat([historic_df, latest_df], ignore_index=True), 
+                        table
+                    )
+                    
+                    # Load to MotherDuck
+                    self.load_to_motherduck(combined_df, table)
+                    
+                except Exception as e:
+                    print(f"Error processing table {table}: {str(e)}")
+                    continue
+                    
+        except Exception as e:
+            print(f"ETL process error: {str(e)}")
+            raise
+        finally:
+            self.duck_conn.close()
+            print("\nETL process completed. Connections closed.")
+
 if __name__ == "__main__":
-    from generate_data import RecentEcommerceDataGenerator
-    
-    # Generate data
-    generator = RecentEcommerceDataGenerator()
-    data = generator.generate_all_data()
-    
-    # Save data to DuckDB
-    save_data(data)
+    try:
+        # Get MotherDuck token from environment variable
+        token = os.getenv('MOTHERDUCK_TOKEN')
+        etl = IncrementalETL(token)
+        etl.run_etl()
+    except Exception as e:
+        print(f"Main execution error: {str(e)}")
+        raise
