@@ -4,23 +4,22 @@ import boto3
 import json
 from sqlalchemy import create_engine
 from dotenv import load_dotenv
-import snowflake.connector
-from snowflake.connector.pandas_tools import write_pandas
 import psycopg2
 import tempfile
 from pandas import json_normalize
 from datetime import datetime
 import uuid
 import io
+import duckdb
 
 load_dotenv()
 
 class IncrementalETL:
-    def __init__(self):
+    def __init__(self, motherduck_token=None):
         # Initialize connections
         self._init_postgres()
         self._init_s3()
-        self._init_snowflake()
+        self._init_motherduck(motherduck_token)
         
         # Define source mappings
         self.postgres_tables = ['categories', 'subcategories', 'order_items', 'interactions']
@@ -46,31 +45,35 @@ class IncrementalETL:
         self.historic_bucket = os.getenv('AWS_S3_HISTORIC_SYNTH')
         self.latest_bucket = os.getenv('AWS_S3_LATEST_SYNTH')
 
-    def _init_snowflake(self):
-        """Initialize Snowflake connection"""
+    def _init_motherduck(self, token):
+        """Initialize MotherDuck connection"""
         try:
-            self.snow_conn = snowflake.connector.connect(
-                user=os.getenv('SNOWFLAKE_USER'),
-                password=os.getenv('SNOWFLAKE_PASSWORD'),
-                account=os.getenv('SNOWFLAKE_ACCOUNT'),
-                warehouse=os.getenv('SNOWFLAKE_WAREHOUSE'),
-                role=os.getenv('SNOWFLAKE_ROLE')
-            )
-            
-            self.snow_cursor = self.snow_conn.cursor()
-            
-            # Setup database and schema
-            for cmd in [
-                f"USE WAREHOUSE {os.getenv('SNOWFLAKE_WAREHOUSE')}",
-                f"USE DATABASE {os.getenv('SNOWFLAKE_DATABASE')}",
-                f"USE SCHEMA {os.getenv('SNOWFLAKE_RAW_SCHEMA')}"
-            ]:
-                self.snow_cursor.execute(cmd)
-                
-        except Exception as e:
-            print(f"Snowflake initialization error: {str(e)}")
-            raise
+            # Use token from parameter or environment variable
+            md_token = token or os.getenv('MOTHERDUCK_TOKEN')
+            if not md_token:
+                raise ValueError("MotherDuck token not provided")
 
+            # First connect to MotherDuck's root
+            root_connection = f"md:?motherduck_token={md_token}"
+            temp_conn = duckdb.connect(root_connection)
+            
+            # Create database if it doesn't exist
+            temp_conn.execute("CREATE DATABASE IF NOT EXISTS ecommerce")
+            temp_conn.close()
+
+            # Now connect to the ecommerce database
+            connection_string = f"md:ecommerce?motherduck_token={md_token}"
+            self.duck_conn = duckdb.connect(connection_string)
+            
+            # Create raw schema if it doesn't exist
+            self.duck_conn.execute("CREATE SCHEMA IF NOT EXISTS raw")
+            
+            print("Successfully connected to MotherDuck")
+            
+        except Exception as e:
+            print(f"MotherDuck initialization error: {str(e)}")
+            raise
+    
     def extract_historic_from_s3(self, table_name):
         """Extract historic data from S3 CSV files"""
         try:
@@ -82,7 +85,9 @@ class IncrementalETL:
             
             # Read CSV content
             csv_content = response['Body'].read().decode('utf-8')
-            return pd.read_csv(io.StringIO(csv_content))
+            df = pd.read_csv(io.StringIO(csv_content))
+            df.columns = [col.upper() for col in df.columns]
+            return df
             
         except Exception as e:
             print(f"Historic S3 extraction error for {table_name}: {str(e)}")
@@ -93,6 +98,7 @@ class IncrementalETL:
         try:
             query = f"SELECT * FROM latest_{table_name}"
             df = pd.read_sql(query, self.pg_engine)
+            df.columns = [col.upper() for col in df.columns]
             return df
         except Exception as e:
             print(f"PostgreSQL extraction error for {table_name}: {str(e)}")
@@ -107,10 +113,14 @@ class IncrementalETL:
             )
             
             json_content = json.loads(response['Body'].read().decode('utf-8'))
-            return pd.DataFrame(json_content['data'])
+            df = pd.DataFrame(json_content['data'])
+            df.columns = [col.upper() for col in df.columns]
+            return df
+        
         except Exception as e:
             print(f"Latest S3 extraction error for {table_name}: {str(e)}")
             raise
+        
     def get_primary_keys(self, table_name):
         """Return primary key columns for each table"""
         pk_mapping = {
@@ -120,8 +130,7 @@ class IncrementalETL:
             'order_items': ['ORDER_ITEM_ID'],
             'categories': ['CATEGORY_ID'],
             'subcategories': ['SUBCATEGORY_ID'],
-            'reviews': ['REVIEW_ID'],
-            'interactions': ['EVENT_ID']
+            'reviews': ['REVIEW_ID']
         }
         return pk_mapping.get(table_name.replace('latest_', ''), ['id'])
 
@@ -151,88 +160,56 @@ class IncrementalETL:
         except Exception as e:
             print(f"Error removing duplicate primary keys for {table_name}: {str(e)}")
             raise
-        
+    
     def transform_data(self, df, table_name):
-        """Transform data with enhanced column handling and debugging"""
+        """Transform data with enhanced column handling and type conversion"""
         try:
             print(f"\nDETAILED COLUMN ANALYSIS FOR {table_name}")
             print("=" * 50)
             
-            # Print initial column state
-            print("Initial columns with types:")
-            for col in df.columns:
-                print(f"- {col}: {df[col].dtype}")
+            # Force column names to uppercase first
+            df.columns = [col.upper() for col in df.columns]
             
-            # Handle datetime columns before any other transformations
+            # Handle reviews table special case - add REVIEW_ID if missing
+            if table_name.upper().startswith('REVIEWS') and 'REVIEW_ID' not in df.columns:
+                df['REVIEW_ID'] = range(1, len(df) + 1)
+            
+            # Convert DATA_SOURCE to string type explicitly
+            if 'DATA_SOURCE' in df.columns:
+                df['DATA_SOURCE'] = df['DATA_SOURCE'].astype(str)
+            
+            # Handle datetime columns
             date_columns = df.select_dtypes(include=['datetime64']).columns
             for col in date_columns:
-                # Convert to pandas datetime with error handling
                 try:
                     df[col] = pd.to_datetime(df[col], errors='coerce')
-                    # Convert to string format
                     df[col] = df[col].dt.strftime('%Y-%m-%d %H:%M:%S')
                 except Exception as e:
                     print(f"Warning: Error converting datetime column {col}: {str(e)}")
-                    # If conversion fails, keep original values
-                    continue
-                
-            # Check for and handle duplicate columns
-            duplicate_cols = df.columns[df.columns.duplicated(keep=False)]
-            if len(duplicate_cols) > 0:
-                print("\nFound duplicate columns:")
-                for col in duplicate_cols:
-                    print(f"- {col}")
-                    
-                # Create a mapping of duplicate columns to their first occurrence
-                col_mapping = {}
-                for col in df.columns:
-                    if col in duplicate_cols:
-                        if col not in col_mapping:
-                            col_mapping[col] = f"{col}_1"
-                        else:
-                            count = len([k for k in col_mapping.values() if k.startswith(col)]) + 1
-                            col_mapping[col] = f"{col}_{count}"
-                    else:
-                        col_mapping[col] = col
-                        
-                # Rename columns using the mapping
-                df.columns = [col_mapping[col] for col in df.columns]
-                
-                print("\nRenamed duplicate columns:")
-                for old_col, new_col in col_mapping.items():
-                    if old_col in duplicate_cols:
-                        print(f"- {old_col} -> {new_col}")
             
-            # Flatten JSON if needed
-            df = self.flatten_json_df(df, table_name)
-            
-            # Add metadata columns
-            df['DATA_SOURCE'] = 'historic'
-            df['BATCH_ID'] = self.batch_id
-            df['LOADED_AT'] = self.batch_timestamp.strftime('%Y-%m-%d %H:%M:%S')
+            # Add metadata columns with explicit types
+            if 'DATA_SOURCE' not in df.columns:
+                df['DATA_SOURCE'] = 'historic'
+            if 'BATCH_ID' not in df.columns:
+                df['BATCH_ID'] = str(self.batch_id)
+            if 'LOADED_AT' not in df.columns:
+                df['LOADED_AT'] = self.batch_timestamp.strftime('%Y-%m-%d %H:%M:%S')
             
             # Handle NA/NaT values
             df = df.replace({pd.NA: None, pd.NaT: None})
             
-            # Convert column names to uppercase
-            df.columns = [col.upper() for col in df.columns]
+            # Remove duplicate rows based on primary keys
             df = self.remove_duplicate_primary_keys(df, table_name)
-            print("\nFinal columns:")
-            print(df.columns.tolist())
             
-            # Verify no duplicates remain
-            if df.columns.duplicated().any():
-                duplicates = df.columns[df.columns.duplicated()].tolist()
-                raise Exception(f"Duplicate columns still exist after transformation: {duplicates}")
+            print("\nFinal columns with types:")
+            for col in df.columns:
+                print(f"- {col}: {df[col].dtype}")
             
             return df
-            
+                
         except Exception as e:
             print(f"Transform error for {table_name}: {str(e)}")
-            print("Full column list at error:")
-            print(df.columns.tolist())
             raise
-
 
     def flatten_json_df(self, df, table_name):
         """Flatten nested JSON structures"""
@@ -292,152 +269,228 @@ class IncrementalETL:
         except Exception as e:
             print(f"Error saving to S3 historic bucket: {str(e)}")
             raise
+        
+    def get_column_types(self, table_name):
+        """Define expected column types for each table"""
+        type_mappings = {
+            'REVIEWS': {
+                'PRODUCT_ID': 'VARCHAR',
+                'ORDER_ID': 'VARCHAR',
+                'CUSTOMER_ID': 'VARCHAR',
+                'REVIEW_ID': 'VARCHAR',
+                'REVIEW_SCORE': 'BIGINT',
+                'REVIEW_TEXT': 'VARCHAR',
+                'DATA_SOURCE': 'VARCHAR',
+                'BATCH_ID': 'VARCHAR',
+                'LOADED_AT': 'TIMESTAMP'
+            },
+            'ORDERS': {
+                'ORDER_ID': 'VARCHAR',
+                'CUSTOMER_ID': 'VARCHAR',
+                'STATUS': 'VARCHAR',
+                'TOTAL_AMOUNT': 'DOUBLE',
+                'SHIPPING_COST': 'DOUBLE',
+                'PAYMENT_METHOD': 'VARCHAR',
+                'SHIPPING_ADDRESS': 'VARCHAR',
+                'BILLING_ADDRESS': 'VARCHAR',
+                'ORDER_DATE': 'TIMESTAMP',
+                'CREATED_AT': 'TIMESTAMP',
+                'UPDATED_AT': 'TIMESTAMP',
+                'DATA_SOURCE': 'VARCHAR',
+                'BATCH_ID': 'VARCHAR',
+                'LOADED_AT': 'TIMESTAMP'
+            },
+            'ORDER_ITEMS': {
+                'ORDER_ITEM_ID': 'VARCHAR',
+                'ORDER_ID': 'VARCHAR',
+                'PRODUCT_ID': 'VARCHAR',
+                'QUANTITY': 'BIGINT',
+                'UNIT_PRICE': 'DOUBLE',
+                'TOTAL_PRICE': 'DOUBLE',
+                'CREATED_AT': 'TIMESTAMP',
+                'DATA_SOURCE': 'VARCHAR',
+                'BATCH_ID': 'VARCHAR',
+                'LOADED_AT': 'TIMESTAMP'
+            },
+            'PRODUCTS': {
+                'PRODUCT_ID': 'VARCHAR',
+                'CATEGORY_ID': 'VARCHAR',
+                'SUBCATEGORY_ID': 'VARCHAR',
+                'PRODUCT_NAME': 'VARCHAR',
+                'DESCRIPTION': 'VARCHAR',
+                'BASE_PRICE': 'DOUBLE',
+                'SALE_PRICE': 'DOUBLE',
+                'STOCK_QUANTITY': 'BIGINT',
+                'WEIGHT_KG': 'DOUBLE',
+                'IS_ACTIVE': 'BOOLEAN',
+                'BRAND': 'VARCHAR',
+                'SKU': 'VARCHAR',
+                'RATING': 'DOUBLE',
+                'REVIEW_COUNT': 'BIGINT',
+                'CREATED_AT': 'TIMESTAMP',
+                'DATA_SOURCE': 'VARCHAR',
+                'BATCH_ID': 'VARCHAR',
+                'LOADED_AT': 'TIMESTAMP'
+            },
+            'CUSTOMERS': {
+                'CUSTOMER_ID': 'VARCHAR',
+                'EMAIL': 'VARCHAR',
+                'FIRST_NAME': 'VARCHAR',
+                'LAST_NAME': 'VARCHAR',
+                'AGE': 'BIGINT',
+                'GENDER': 'VARCHAR',
+                'ANNUAL_INCOME': 'DOUBLE',
+                'MARITAL_STATUS': 'VARCHAR',
+                'EDUCATION': 'VARCHAR',
+                'LOCATION_TYPE': 'VARCHAR',
+                'CITY': 'VARCHAR',
+                'STATE': 'VARCHAR',
+                'COUNTRY': 'VARCHAR',
+                'SIGNUP_DATE': 'TIMESTAMP',
+                'LAST_LOGIN': 'TIMESTAMP',
+                'PREFERRED_CHANNEL': 'VARCHAR',
+                'IS_ACTIVE': 'BOOLEAN',
+                'DATA_SOURCE': 'VARCHAR',
+                'BATCH_ID': 'VARCHAR',
+                'LOADED_AT': 'TIMESTAMP'
+            }
+        }
+        return type_mappings.get(table_name.upper().replace('LATEST_', ''), {})
 
-    def load_to_snowflake(self, df, table_name):
-        """Incrementally load data to Snowflake handling duplicates properly"""
+    def convert_column_types(self, df, table_name):
+        """Convert DataFrame columns to appropriate types"""
+        expected_types = self.get_column_types(table_name)
+        
+        if not expected_types:
+            return df  # Return unchanged if no type mapping exists
+        
+        for column in df.columns:
+            if column in expected_types:
+                try:
+                    dtype = expected_types[column]
+                    if dtype == 'BIGINT':
+                        df[column] = pd.to_numeric(df[column], errors='coerce').fillna(0).astype('int64')
+                    elif dtype == 'DOUBLE':
+                        df[column] = pd.to_numeric(df[column], errors='coerce').fillna(0.0)
+                    elif dtype == 'VARCHAR':
+                        # Special handling for ID columns
+                        if column.endswith('_ID'):
+                            df[column] = df[column].fillna('').astype(str)
+                        else:
+                            df[column] = df[column].fillna('').astype(str)
+                    elif dtype == 'BOOLEAN':
+                        df[column] = df[column].fillna(False).astype(bool)
+                    elif dtype == 'TIMESTAMP':
+                        df[column] = pd.to_datetime(df[column], errors='coerce')
+                        df[column] = df[column].dt.strftime('%Y-%m-%d %H:%M:%S')
+                except Exception as e:
+                    print(f"Warning: Error converting column {column} to {dtype}: {str(e)}")
+                    # Keep the original data if conversion fails
+                    continue
+        
+        return df
+
+    def get_duck_type(self, dtype, column_name):
+        """Determine DuckDB column type based on pandas dtype and column name"""
+        # Always use VARCHAR for ID columns
+        if column_name.upper().endswith('_ID'):
+            return 'VARCHAR'
+        
+        # Handle other types
+        if pd.api.types.is_integer_dtype(dtype):
+            return 'BIGINT'
+        elif pd.api.types.is_float_dtype(dtype):
+            return 'DOUBLE'
+        elif pd.api.types.is_bool_dtype(dtype):
+            return 'BOOLEAN'
+        elif pd.api.types.is_datetime64_any_dtype(dtype):
+            return 'TIMESTAMP'
+        else:
+            return 'VARCHAR'
+
+    def load_to_motherduck(self, df, table_name):
+        """Load data to MotherDuck with type handling"""
         try:
-            database = os.getenv('SNOWFLAKE_DATABASE')
-            schema = os.getenv('SNOWFLAKE_RAW_SCHEMA')
-            full_table_name = f"{database}.{schema}.{table_name.upper()}"
-            temp_table_name = f"{database}.{schema}.TEMP_{table_name.upper()}"
+            full_table_name = f"raw.{table_name.lower()}"
+            temp_table_name = f"raw.temp_{table_name.lower()}"
+            
+            # Force string types for metadata columns
+            metadata_columns = ['DATA_SOURCE', 'BATCH_ID']
+            for col in metadata_columns:
+                if col in df.columns:
+                    df[col] = df[col].astype(str)
+            
+            # Get column definitions with explicit types
+            column_definitions = []
+            for col, dtype in df.dtypes.items():
+                col_type = self.get_duck_type(dtype, col)
+                if col in metadata_columns:
+                    col_type = 'VARCHAR'  # Force VARCHAR for metadata columns
+                column_definitions.append(f'"{col}" {col_type}')
+            
+            # Create temporary table
+            create_temp_table_sql = f"""
+            CREATE TABLE {temp_table_name} (
+                {', '.join(column_definitions)}
+            )
+            """
+            
+            # Drop existing temp table if exists
+            self.duck_conn.execute(f"DROP TABLE IF EXISTS {temp_table_name}")
+            
+            # Create new temp table
+            print(f"Creating temp table with columns: {column_definitions}")
+            self.duck_conn.execute(create_temp_table_sql)
+            
+            # Load data into temp table
+            self.duck_conn.execute(f"INSERT INTO {temp_table_name} SELECT * FROM df")
+            
+            # Create target table if it doesn't exist
+            self.duck_conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {full_table_name} (
+                    {', '.join(column_definitions)}
+                )
+            """)
             
             # Get primary keys
             primary_keys = [pk.upper() for pk in self.get_primary_keys(table_name)]
-
-            # Create temporary table for staging the new data
-            column_definitions = []
-            for col_name, dtype in df.dtypes.items():
-                sf_type = "VARCHAR"
-                if pd.api.types.is_integer_dtype(dtype):
-                    sf_type = "NUMBER"
-                elif pd.api.types.is_float_dtype(dtype):
-                    sf_type = "FLOAT"
-                elif pd.api.types.is_datetime64_any_dtype(dtype):
-                    sf_type = "TIMESTAMP"
-                column_definitions.append(f'"{col_name}" {sf_type}')
-
-            # Drop temp table if exists
-            self.snow_cursor.execute(f"DROP TABLE IF EXISTS {temp_table_name}")
-
-            # Create temp table
-            create_temp_table_sql = f"""
-            CREATE TEMPORARY TABLE {temp_table_name} (
-                {', '.join(column_definitions)}
-            )
-            """
-            self.snow_cursor.execute(create_temp_table_sql)
-
-            # Load data into temp table
-            success, num_chunks, num_rows, _ = write_pandas(
-                conn=self.snow_conn,
-                df=df,
-                table_name=f"TEMP_{table_name.upper()}",
-                database=database,
-                schema=schema,
-                quote_identifiers=False
-            )
-
-            if not success:
-                raise Exception(f"Failed to load data to temporary table for {table_name}")
-
-            # Create target table if it doesn't exist
-            create_table_sql = f"""
-            CREATE TABLE IF NOT EXISTS {full_table_name} (
-                {', '.join(column_definitions)}
-            )
-            """
-            self.snow_cursor.execute(create_table_sql)
-
-            # Get all columns except metadata for comparison
-            compare_columns = [col for col in df.columns if col.upper() not in ['DATA_SOURCE', 'BATCH_ID', 'LOADED_AT']]
             
-            # Build comparison conditions for each non-metadata column
-            comparison_conditions = []
-            for col in compare_columns:
-                condition = f"""
-                (
-                    target."{col}" != source."{col}"
-                    OR (target."{col}" IS NULL AND source."{col}" IS NOT NULL)
-                    OR (target."{col}" IS NOT NULL AND source."{col}" IS NULL)
-                )
-                """
-                comparison_conditions.append(condition)
-
-            # Join all comparison conditions with OR
-            comparison_clause = " OR ".join(comparison_conditions)
-
-            # Construct MERGE statement
-            merge_sql = f"""
-            MERGE INTO {full_table_name} target
-            USING (
-                SELECT *,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY {', '.join([f'"{pk}"' for pk in primary_keys])}
-                        ORDER BY "LOADED_AT" DESC
-                    ) as rn
-                FROM {temp_table_name}
-            ) source
-            ON {' AND '.join([f'target."{pk}" = source."{pk}"' for pk in primary_keys])}
-            AND source.rn = 1
-            WHEN MATCHED AND ({comparison_clause})
-            THEN UPDATE SET
-                {', '.join([f'"{col}" = source."{col}"' for col in df.columns])}
-            WHEN NOT MATCHED AND source.rn = 1
-            THEN INSERT (
-                {', '.join([f'"{col}"' for col in df.columns])}
-            )
-            VALUES (
-                {', '.join([f'source."{col}"' for col in df.columns])}
-            )
-            """
-
-            # Execute merge
-            self.snow_cursor.execute(merge_sql)
-
-            # Clean up temp table
-            self.snow_cursor.execute(f"DROP TABLE IF EXISTS {temp_table_name}")
-
-            print(f"""Successfully loaded data to {full_table_name}:
-            - Rows processed: {num_rows}
-            - Using primary keys: {', '.join(primary_keys)}""")
-
+            # Delete existing records that will be updated
+            delete_condition = " AND ".join([
+                f"{full_table_name}.\"{pk}\" IN (SELECT \"{pk}\" FROM {temp_table_name})"
+                for pk in primary_keys
+            ])
+            
+            self.duck_conn.execute(f"""
+                DELETE FROM {full_table_name}
+                WHERE {delete_condition}
+            """)
+            
+            # Insert new records
+            self.duck_conn.execute(f"""
+                INSERT INTO {full_table_name}
+                SELECT * FROM {temp_table_name}
+            """)
+            
+            # Get stats
+            row_count = self.duck_conn.execute(f"""
+                SELECT COUNT(*) FROM {full_table_name}
+            """).fetchone()[0]
+            
+            # Clean up
+            self.duck_conn.execute(f"DROP TABLE IF EXISTS {temp_table_name}")
+            
+            print(f"Successfully loaded data to {full_table_name}:")
+            print(f"- Rows in table: {row_count}")
+            
         except Exception as e:
-            print(f"Error loading to Snowflake: {str(e)}")
+            print(f"Error loading to MotherDuck: {str(e)}")
             raise
-        
-    def get_date_column(self, table_name):
-        """Return the appropriate date column for each table with fallbacks"""
-        date_columns = {
-            'customers': ['signup_date', 'last_login', 'created_at'],
-            'orders': ['order_date', 'created_at', 'updated_at'],
-            'products': ['created_at'],
-            'order_items': ['created_at', 'order_date'],
-            'reviews': ['created_at', 'order_date'],
-            'interactions': ['event_date', 'created_at'],
-            'categories': ['created_at'],
-            'subcategories': ['created_at']
-        }
-        
-        clean_table_name = table_name.replace('latest_', '')
-        return date_columns.get(clean_table_name, ['created_at'])
 
-    def find_valid_date_column(self, df, table_name):
-        """Find the first valid date column from the possible options"""
-        possible_columns = self.get_date_column(table_name)
-        
-        for col in possible_columns:
-            if col in df.columns:
-                return col
-                
-        return None
-        
     def run_etl(self):
-        """Execute ETL process with historic CSV data"""
+        """Execute ETL process"""
         try:
             print("\nStarting ETL process...")
-            
-            # Create local directory for CSV files if it doesn't exist
-            os.makedirs("ingested_data", exist_ok=True)
             
             for table in self.postgres_tables + self.s3_tables:
                 print(f"\nProcessing {table}")
@@ -447,105 +500,53 @@ class IncrementalETL:
                     historic_df = self.extract_historic_from_s3(table)
                     
                     # Extract latest data from original sources
-                    latest_df = (self.extract_latest_from_s3(table) 
+                    latest_df = (self.extract_latest_from_s3(table)
                             if table in self.s3_tables 
                             else self.extract_latest_from_postgres(table))
                     
-                    # Transform data before date handling
-                    latest_transformed_df = self.transform_data(latest_df, table)
-                    historic_transformed_df = self.transform_data(historic_df, table)
+                    # Transform each dataset separately first
+                    historic_df = self.transform_data(historic_df, f"{table}")
+                    latest_df = self.transform_data(latest_df, f"latest_{table}")
                     
-                    # Find valid date column
-                    date_column = self.find_valid_date_column(latest_transformed_df, table)
+                    # Ensure columns match before concatenation
+                    all_columns = list(set(historic_df.columns) | set(latest_df.columns))
                     
-                    if date_column:
-                        try:
-                            # Convert date columns to datetime for comparison
-                            latest_transformed_df[date_column] = pd.to_datetime(latest_transformed_df[date_column])
-                            historic_transformed_df[date_column] = pd.to_datetime(historic_transformed_df[date_column])
-                            
-                            min_latest_date = latest_transformed_df[date_column].min()
-                            print(f"Latest data starts from: {min_latest_date}")
-                            
-                            if date_column in historic_transformed_df.columns:
-                                historic_transformed_df = historic_transformed_df[
-                                    historic_transformed_df[date_column] < min_latest_date
-                                ]
-                            
-                            # Convert back to string format for consistency
-                            latest_transformed_df[date_column] = latest_transformed_df[date_column].dt.strftime('%Y-%m-%d %H:%M:%S')
-                            historic_transformed_df[date_column] = historic_transformed_df[date_column].dt.strftime('%Y-%m-%d %H:%M:%S')
-                        except Exception as e:
-                            print(f"Warning: Error processing date column {date_column}: {str(e)}")
-                            # Continue without date filtering if there's an error
-                            min_latest_date = None
-                    else:
-                        print(f"Warning: No valid date column found for {table}")
-                        min_latest_date = None
+                    # Add missing columns with NULL values
+                    for col in all_columns:
+                        if col not in historic_df.columns:
+                            historic_df[col] = None
+                        if col not in latest_df.columns:
+                            latest_df[col] = None
                     
-                    # Get primary keys for deduplication
-                    primary_keys = self.get_primary_keys(table)
+                    # Reorder columns to match
+                    historic_df = historic_df[all_columns]
+                    latest_df = latest_df[all_columns]
                     
-                    # Combine data
-                    combined_df = pd.concat([historic_transformed_df, latest_transformed_df], ignore_index=True)
-
-                    print(f"Removed {len(historic_transformed_df) + len(latest_transformed_df) - len(combined_df)} duplicate records")
+                    # Combine datasets
+                    combined_df = pd.concat([historic_df, latest_df], ignore_index=True)
                     
-                    # Save to local CSV
-                    combined_path = f"ingested_data/{table}_combined.csv"
-                    combined_df.to_csv(combined_path, index=False)
-                    print(f"Saved combined data to {combined_path}")
+                    # Final transformation on combined data
+                    transformed_df = self.transform_data(combined_df, table)
                     
-                    # Prepare metadata
-                    metadata = {
-                        'table_name': table,
-                        'batch_id': self.batch_id,
-                        'timestamp': str(self.batch_timestamp),
-                        'historic_records': len(historic_transformed_df),
-                        'latest_records': len(latest_transformed_df),
-                        'total_records': len(combined_df),
-                        'removed_duplicates': len(historic_transformed_df) + len(latest_transformed_df) - len(combined_df),
-                        'date_column_used': date_column,
-                        'primary_keys_used': primary_keys,
-                        'columns': combined_df.columns.tolist(),
-                        'data_types': {col: str(dtype) for col, dtype in combined_df.dtypes.items()},
-                        'min_date': str(min_latest_date) if min_latest_date is not None else None
-                    }
+                    # Load to MotherDuck
+                    self.load_to_motherduck(transformed_df, table)
                     
-                    # Save to S3 as historic data
-                    self.save_to_s3_historic(combined_df, table, metadata)
-                    
-                    # Load to Snowflake
-                    self.load_to_snowflake(combined_df, table)
-                    
-                    print(f"""
-                    Completed processing for {table}:
-                    - Historic records: {len(historic_transformed_df)}
-                    - Latest records: {len(latest_transformed_df)}
-                    - Duplicates removed: {len(historic_transformed_df) + len(latest_transformed_df) - len(combined_df)}
-                    - Total records processed: {len(combined_df)}
-                    - Date column used: {date_column if date_column else 'None'}
-                    - Primary keys used: {', '.join(primary_keys)}
-                    - Data saved locally to: {combined_path}
-                    - Data saved to S3 historic bucket
-                    - Data loaded to Snowflake table: {table.upper()}
-                    """)
-
                 except Exception as e:
                     print(f"Error processing table {table}: {str(e)}")
                     continue
-
+                    
         except Exception as e:
             print(f"ETL process error: {str(e)}")
             raise
         finally:
-            self.snow_cursor.close()
-            self.snow_conn.close()
+            self.duck_conn.close()
             print("\nETL process completed. Connections closed.")
-        
+            
 if __name__ == "__main__":
     try:
-        etl = IncrementalETL()
+        # Get MotherDuck token from environment variable
+        token = os.getenv('MOTHERDUCK_TOKEN')
+        etl = IncrementalETL(token)
         etl.run_etl()
     except Exception as e:
         print(f"Main execution error: {str(e)}")
