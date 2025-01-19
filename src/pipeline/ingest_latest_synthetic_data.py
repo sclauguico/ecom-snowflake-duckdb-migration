@@ -58,15 +58,15 @@ class IncrementalETL:
             temp_conn = duckdb.connect(root_connection)
             
             # Create database if it doesn't exist
-            temp_conn.execute("CREATE DATABASE IF NOT EXISTS ecommerce")
+            temp_conn.execute("CREATE DATABASE IF NOT EXISTS ecom_db")
             temp_conn.close()
 
-            # Now connect to the ecommerce database
-            connection_string = f"md:ecommerce?motherduck_token={md_token}"
+            # Now connect to the ecom database
+            connection_string = f"md:ecom_db?motherduck_token={md_token}"
             self.duck_conn = duckdb.connect(connection_string)
             
-            # Create raw schema if it doesn't exist
-            self.duck_conn.execute("CREATE SCHEMA IF NOT EXISTS raw")
+            # Create ecom_raw schema if it doesn't exist
+            self.duck_conn.execute("CREATE SCHEMA IF NOT EXISTS ecom_raw")
             
             print("Successfully connected to MotherDuck")
             
@@ -411,8 +411,8 @@ class IncrementalETL:
     def load_to_motherduck(self, df, table_name):
         """Load data to MotherDuck with type handling"""
         try:
-            full_table_name = f"raw.{table_name.lower()}"
-            temp_table_name = f"raw.temp_{table_name.lower()}"
+            full_table_name = f"ecom_raw.{table_name.lower()}"
+            temp_table_name = f"ecom_raw.temp_{table_name.lower()}"
             
             # Force string types for metadata columns
             metadata_columns = ['DATA_SOURCE', 'BATCH_ID']

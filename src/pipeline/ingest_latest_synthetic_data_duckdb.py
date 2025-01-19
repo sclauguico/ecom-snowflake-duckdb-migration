@@ -741,13 +741,38 @@ class IncrementalETL:
         try:
             print("\nResetting local DuckDB...")
             
-            # Remove existing database file if it exists
-            if os.path.exists('ecommerce.db'):
-                os.remove('ecommerce.db')
-                print("Existing local database file removed")
+            # Ensure existing connection is closed
+            if hasattr(self, 'duck_conn'):
+                self.duck_conn.close()
+
+            
+            # Try to remove the file, with error handling
+            try:
+                if os.path.exists('ecom_db'):
+                    os.remove('ecom_db')
+                    print("Existing local database file removed")
+            except PermissionError:
+                print("Could not remove ecom_db. Attempting alternative cleanup.")
+                
+                # Alternative approach: use duckdb to detach and remove
+                try:
+                    # Forcefully close any existing connections
+                    duckdb.close_all_connections()
+                    
+                    # Wait a moment to ensure connections are closed
+                    import time
+                    time.sleep(1)
+                    
+                    # Try removing again
+                    if os.path.exists('ecom_db'):
+                        os.remove('ecom_db')
+                        print("Database file removed successfully after connection closure")
+                except Exception as e:
+                    print(f"Failed to remove database file: {e}")
+                    raise
             
             # Create fresh connection
-            self.duck_conn = duckdb.connect('ecommerce.db')
+            self.duck_conn = duckdb.connect('ecom_db')
             
             # Create schema
             self.duck_conn.execute("CREATE SCHEMA IF NOT EXISTS ecom_raw")
