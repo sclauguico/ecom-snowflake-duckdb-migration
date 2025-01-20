@@ -1,6 +1,6 @@
-category_id,category_name,created_at,data_source,batch_id,loaded_at
-1,Electronics,2023-01-01 00:00:00,historic,ad9d7f00-f7ce-4e93-8ac7-b0f9d788597e,2025-01-12 07:43:19
-2,Fashion,2023-01-01 00:00:00,historic,ad9d7f00-f7ce-4e93-8ac7-b0f9d788597e,2025-01-12 07:43:19
-3,Home & Living,2023-01-01 00:00:00,historic,ad9d7f00-f7ce-4e93-8ac7-b0f9d788597e,2025-01-12 07:43:19
-4,Beauty,2023-01-01 00:00:00,historic,ad9d7f00-f7ce-4e93-8ac7-b0f9d788597e,2025-01-12 07:43:19
-5,Sports,2023-01-01 00:00:00,historic,ad9d7f00-f7ce-4e93-8ac7-b0f9d788597e,2025-01-12 07:43:19
+CATEGORY_ID,CATEGORY_NAME,CREATED_AT,DATA_SOURCE,BATCH_ID,LOADED_AT
+1,Electronics,2023-01-01 00:00:00,historic,0747a54f-d6af-4a36-9c4c-84ee4f511e9f,2025-01-12 10:24:12
+2,Fashion,2023-01-01 00:00:00,historic,0747a54f-d6af-4a36-9c4c-84ee4f511e9f,2025-01-12 10:24:12
+3,Home & Living,2023-01-01 00:00:00,historic,0747a54f-d6af-4a36-9c4c-84ee4f511e9f,2025-01-12 10:24:12
+4,Beauty,2023-01-01 00:00:00,historic,0747a54f-d6af-4a36-9c4c-84ee4f511e9f,2025-01-12 10:24:12
+5,Sports,2023-01-01 00:00:00,historic,0747a54f-d6af-4a36-9c4c-84ee4f511e9f,2025-01-12 10:24:12
