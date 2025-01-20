@@ -1,0 +1,20 @@
+dbt_duckdb:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: ../../ecom_db
+      schema: ecom_staging
+      threads: 4
+
+motherduck:
+  target: prod
+  outputs:
+    prod:
+      type: duckdb
+      path: "md:ecom_db"
+      schema: ecom_staging
+      threads: 4
+      motherduck_token: "{{ env_var('MOTHERDUCK_TOKEN') }}"
+      connect_args:
+        endpoint: "https://api.motherduck.com"
