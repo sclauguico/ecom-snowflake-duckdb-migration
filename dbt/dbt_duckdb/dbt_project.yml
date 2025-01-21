@@ -27,7 +27,6 @@ models:
     # Mart models
     ecom_marts:
       +materialized: table
-      +schema: ecom_marts
       +tags: ["marts"]
 
 vars:
