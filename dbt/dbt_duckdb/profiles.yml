@@ -4,7 +4,7 @@ dbt_duckdb:
     dev:
       type: duckdb
       path: ../../ecom_db
-      schema: ecom_staging
+      schema: ecom_intermediate
       threads: 4
 
 motherduck:
@@ -13,7 +13,7 @@ motherduck:
     prod:
       type: duckdb
       path: "md:ecom_db"
-      schema: ecom_staging
+      schema: ecom_intermediate
       threads: 4
       motherduck_token: "{{ env_var('MOTHERDUCK_TOKEN') }}"
       connect_args:

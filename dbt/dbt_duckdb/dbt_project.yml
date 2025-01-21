@@ -22,7 +22,6 @@ models:
     # Intermediate models
     ecom_intermediate:
       +materialized: table
-      +schema: ecom_intermediate
       +tags: ["intermediate"]
     
     # Mart models
