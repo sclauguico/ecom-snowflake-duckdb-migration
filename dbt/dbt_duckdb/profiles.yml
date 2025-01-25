@@ -1,16 +1,42 @@
-dbt_duckdb:
+duckdb:
   target: dev
   outputs:
-    dev:
+    dev_staging:
       type: duckdb
       path: ../../ecom_db
-      schema: ecom_marts
+      schema: ecom_staging
+      threads: 4
+    dev_intermediate:
+      type: duckdb
+      path: ../../ecom_db
+      schema: ecom_intermediate
+      threads: 4
+    dev_marts:
+      type: duckdb
+      path: ../../ecom_db
+      schema: ecom_intermediate
       threads: 4
 
 motherduck:
   target: prod
   outputs:
-    prod:
+    prod_staging:
+      type: duckdb
+      path: "md:ecom_db"
+      schema: ecom_staging
+      threads: 4
+      motherduck_token: "{{ env_var('MOTHERDUCK_TOKEN') }}"
+      connect_args:
+        endpoint: "https://api.motherduck.com"
+    prod_intermediate:
+      type: duckdb
+      path: "md:ecom_db"
+      schema: ecom_intermediate
+      threads: 4
+      motherduck_token: "{{ env_var('MOTHERDUCK_TOKEN') }}"
+      connect_args:
+        endpoint: "https://api.motherduck.com"
+    prod_marts:
       type: duckdb
       path: "md:ecom_db"
       schema: ecom_marts
