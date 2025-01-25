@@ -1,0 +1,8 @@
+dbt run --profile duckdb --target dev_staging --select ecom_staging
+dbt run --profile motherduck --target prod_staging --select ecom_staging
+
+dbt run --profile duckdb --target dev_intermediate --select ecom_intermediate
+dbt run --profile motherduck --target prod_intermediate --select ecom_intermediate
+
+dbt run --profile duckdb --target dev_marts --select ecom_marts
+dbt run --profile motherduck --target prod_marts --select ecom_marts
