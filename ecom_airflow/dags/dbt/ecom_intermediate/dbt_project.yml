@@ -18,7 +18,7 @@ clean-targets:
 
 models:
   ecom_data_model:
-    ecom_staging:
+    ecom_intermediate:
       +materialized: view
       motherduck_warehouse: ECOM_WH
-      schema: ecom_staging
+      schema: ecom_intermediate

@@ -26,3 +26,4 @@ USER astro
 
 # Copy dbt project files
 COPY dags/dbt/ecom_staging/ /usr/local/airflow/dbt/ecom_staging/
+COPY dags/dbt/ecom_intermediate/ /usr/local/airflow/dbt/ecom_intermediate/
