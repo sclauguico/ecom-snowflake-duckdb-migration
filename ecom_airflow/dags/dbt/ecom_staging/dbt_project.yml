@@ -2,7 +2,7 @@ name: 'ecom_staging'
 version: '1.0.0'
 config-version: 2
 
-profile: 'duckdb'
+profile: 'motherduck'
 
 model-paths: ["models"]
 analysis-paths: ["analyses"]
@@ -17,9 +17,9 @@ clean-targets:
   - "dbt_packages"
 
 models:
-  ecom_staging:
+  ecom_data_model:
     # Config indicated by + and applies to all files under models/example/
-    staging:
+    ecom_staging:
       +materialized: view
       snowflake_warehouse: ECOM_WH
-      schema: ECOM_STAGING
+      schema: ecom_staging

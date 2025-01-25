@@ -3,8 +3,8 @@ from airflow import DAG
 from cosmos import DbtDag, ProjectConfig, ProfileConfig
 from datetime import datetime
 
-ENV = os.getenv("DBT_ENV", "dev")
-target_profile = "duckdb"  # Match profile name in dbt_project.yml
+ENV = os.getenv("DBT_ENV", "prod")
+target_profile = "motherduck"
 target_name = "prod" if ENV == "prod" else "dev"
 
 # Define project directory
