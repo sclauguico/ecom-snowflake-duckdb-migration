@@ -1,0 +1,13 @@
+FROM quay.io/astronomer/astro-runtime:9.1.0
+
+# Install dbt-duckdb
+RUN python -m pip install --no-cache-dir dbt-duckdb==1.6.1
+
+# Create directory for dbt
+RUN mkdir -p /usr/local/airflow/dbt
+
+# Copy dbt project files
+COPY dbt/ /usr/local/airflow/dbt/
+
+# Install dbt dependencies
+RUN cd /usr/local/airflow/dbt && dbt deps
