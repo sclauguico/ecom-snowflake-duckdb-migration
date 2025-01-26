@@ -1,4 +1,4 @@
-name: 'ecom_staging'
+name: 'ecom_intermediate'
 version: '1.0.0'
 config-version: 2
 
@@ -20,5 +20,18 @@ models:
   ecom_data_model:
     ecom_intermediate:
       +materialized: view
-      motherduck_warehouse: ECOM_WH
-      schema: ecom_intermediate
+      +schema: ecom_intermediate
+      +persist_docs:
+        relation: true
+        columns: true
+    config:
+      persist_database: true
+
+vars:
+  source_database: 'ecom_db'
+  
+seeds:
+  ecom_intermediate:
+    +schema: ecom_intermediate
+    +persist_docs:
+      relation: true

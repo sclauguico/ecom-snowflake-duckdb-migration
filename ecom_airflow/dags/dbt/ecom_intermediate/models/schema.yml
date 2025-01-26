@@ -15,6 +15,7 @@ sources:
       - name: stg_subcategories
 
 models:
+  # --- DIMENSION TABLES ---
   - name: locations
     description: Normalized dimension table for all locations
     columns:
@@ -32,7 +33,22 @@ models:
       - name: country
         tests:
           - not_null
-    
+
+  - name: addresses
+    description: Normalized dimension table for all addresses
+    columns:
+      - name: address_id
+        description: Surrogate key for address
+        tests:
+          - unique
+          - not_null
+      - name: location_id
+        description: Foreign key to locations
+        tests:
+          - relationships:
+              to: ref('locations')
+              field: location_id
+
   - name: brands
     description: Normalized dimension table for product brands
     columns:
@@ -98,39 +114,31 @@ models:
         tests:
           - not_null
 
-  - name: addresses
-    description: Normalized dimension table for all addresses
+  - name: categories_enriched
+    description: Enriched category dimension with related metrics
     columns:
-      - name: address_id
-        description: Surrogate key for address
+      - name: category_id
+        description: Natural key for category
         tests:
           - unique
           - not_null
-      - name: location_id
-        description: Foreign key to locations
+      - name: category_name
         tests:
-          - relationships:
-              to: ref('locations')
-              field: location_id
+          - not_null
 
-  - name: customers_enriched
-    description: Enriched customer dimension with related attributes and metrics
+  - name: subcategories_enriched
+    description: Enriched subcategory dimension with related metrics
     columns:
-      - name: customer_id
-        description: Natural key for customer
+      - name: subcategory_id
+        description: Natural key for subcategory
         tests:
           - unique
           - not_null
-      - name: education_id
+      - name: category_id
         tests:
           - relationships:
-              to: ref('education_types')
-              field: education_id
-      - name: location_id
-        tests:
-          - relationships:
-              to: ref('locations')
-              field: location_id
+              to: ref('categories_enriched')
+              field: category_id
 
   - name: products_enriched
     description: Enriched product dimension with related attributes and metrics
@@ -151,6 +159,26 @@ models:
               to: ref('brands')
               field: brand_id
 
+  - name: customers_enriched
+    description: Enriched customer dimension with related attributes and metrics
+    columns:
+      - name: customer_id
+        description: Natural key for customer
+        tests:
+          - unique
+          - not_null
+      - name: education_id
+        tests:
+          - relationships:
+              to: ref('education_types')
+              field: education_id
+      - name: location_id
+        tests:
+          - relationships:
+              to: ref('locations')
+              field: location_id
+
+  # --- FACT TABLES ---
   - name: orders
     description: Order fact table with related dimensions
     columns:
@@ -162,7 +190,7 @@ models:
       - name: customer_id
         tests:
           - relationships:
-              to: ref('customers_enriched')
+              to: source('ecom_staging', 'stg_customers')
               field: customer_id
       - name: status_id
         tests:
@@ -181,7 +209,7 @@ models:
       - name: order_id
         tests:
           - relationships:
-              to: ref('orders')
+              to: source('ecom_staging', 'stg_orders')
               field: order_id
       - name: product_id
         tests:
@@ -209,22 +237,14 @@ models:
               to: ref('products_enriched')
               field: product_id
 
-  - name: subcategories_enriched
-    description: Enriched subcategory dimension with related metrics
+  - name: reviews_enriched
+    description: Enriched reviews with related dimensions
     columns:
-      - name: subcategory_id
-        description: Natural key for subcategory
+      - name: review_id
+        description: Natural key for review
         tests:
           - unique
           - not_null
-      - name: category_id
-        tests:
-          - relationships:
-              to: ref('categories_enriched')
-              field: category_id
-
-  - name: reviews_enriched
-    columns:
       - name: product_id
         tests:
           - not_null
@@ -234,6 +254,12 @@ models:
       - name: order_id
         tests:
           - not_null
+          - relationships:
+              to: ref('orders')
+              field: order_id
       - name: customer_id
         tests:
           - not_null
+          - relationships:
+              to: ref('customers_enriched')
+              field: customer_id
