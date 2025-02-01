@@ -19,7 +19,14 @@ class IncrementalETL:
         # Initialize connections
         self._init_postgres()
         self._init_s3()
-        self._init_motherduck(motherduck_token)
+        self._init_duckdb()
+        # self._init_motherduck(motherduck_token)
+        
+        # Store token for later use after database reset
+        self.motherduck_token = motherduck_token or os.getenv('MOTHERDUCK_TOKEN')
+        if not self.motherduck_token:
+            raise ValueError("MotherDuck token not provided")
+        
         
         # Define source mappings
         self.postgres_tables = ['categories', 'subcategories', 'order_items', 'interactions']
@@ -28,7 +35,7 @@ class IncrementalETL:
         # Track batch information
         self.batch_id = str(uuid.uuid4())
         self.batch_timestamp = datetime.now()
-    
+        
     def _init_postgres(self):
         """Initialize PostgreSQL connection"""
         self.pg_conn_string = f"postgresql://{os.getenv('POSTGRES_USER')}:{os.getenv('POSTGRES_PASSWORD')}@{os.getenv('POSTGRES_HOST')}:{os.getenv('POSTGRES_PORT')}/{os.getenv('POSTGRES_DB')}"
@@ -45,6 +52,21 @@ class IncrementalETL:
         self.historic_bucket = os.getenv('AWS_S3_HISTORIC_SYNTH')
         self.latest_bucket = os.getenv('AWS_S3_LATEST_SYNTH')
 
+    def _init_duckdb(self):
+        """Initialize local DuckDB connection"""
+        try:
+            # Connect to local DuckDB file
+            self.duck_conn = duckdb.connect('ecom_db')
+            
+            # Create schema if it doesn't exist
+            self.duck_conn.execute("CREATE SCHEMA IF NOT EXISTS ecom_raw")
+            
+            print("Successfully connected to local DuckDB")
+            
+        except Exception as e:
+            print(f"Local DuckDB initialization error: {str(e)}")
+            raise
+
     def _init_motherduck(self, token):
         """Initialize MotherDuck connection"""
         try:
@@ -53,27 +75,29 @@ class IncrementalETL:
             if not md_token:
                 raise ValueError("MotherDuck token not provided")
 
-            # First connect to MotherDuck's root
-            root_connection = f"md:?motherduck_token={md_token}"
-            temp_conn = duckdb.connect(root_connection)
+            # First connect to MotherDuck without specifying a database
+            connection_string = f"md:?motherduck_token={md_token}"
+            self.md_conn = duckdb.connect(connection_string)
             
             # Create database if it doesn't exist
-            temp_conn.execute("CREATE DATABASE IF NOT EXISTS ecom_db")
-            temp_conn.close()
-
-            # Now connect to the ecom database
-            connection_string = f"md:ecom_db?motherduck_token={md_token}"
-            self.duck_conn = duckdb.connect(connection_string)
+            self.md_conn.execute("CREATE DATABASE IF NOT EXISTS ecom_db")
             
-            # Create ecom_raw schema if it doesn't exist
-            self.duck_conn.execute("CREATE SCHEMA IF NOT EXISTS ecom_raw")
+            # Close initial connection
+            self.md_conn.close()
+            
+            # Now connect specifically to the ecom_db database
+            connection_string = f"md:ecom_db?motherduck_token={md_token}"
+            self.md_conn = duckdb.connect(connection_string)
+            
+            # Create schema if it doesn't exist
+            self.md_conn.execute("CREATE SCHEMA IF NOT EXISTS ecom_raw")
             
             print("Successfully connected to MotherDuck")
             
         except Exception as e:
             print(f"MotherDuck initialization error: {str(e)}")
             raise
-    
+
     def extract_historic_from_s3(self, table_name):
         """Extract historic data from S3 CSV files"""
         try:
@@ -124,38 +148,46 @@ class IncrementalETL:
     def get_primary_keys(self, table_name):
         """Return primary key columns for each table"""
         pk_mapping = {
-            'customers': ['CUSTOMER_ID'],
-            'orders': ['ORDER_ID'],
-            'products': ['PRODUCT_ID'],
-            'order_items': ['ORDER_ITEM_ID'],
-            'categories': ['CATEGORY_ID'],
-            'subcategories': ['SUBCATEGORY_ID'],
-            'reviews': ['REVIEW_ID']
+            'CUSTOMERS': ['CUSTOMER_ID'],
+            'ORDERS': ['ORDER_ID'],
+            'PRODUCTS': ['PRODUCT_ID'],
+            'ORDER_ITEMS': ['ORDER_ITEM_ID'],
+            'CATEGORIES': ['CATEGORY_ID'],
+            'SUBCATEGORIES': ['SUBCATEGORY_ID'],
+            'REVIEWS': ['REVIEW_ID'],
+            'INTERACTIONS': ['EVENT_ID']  # Changed from 'id'
         }
-        return pk_mapping.get(table_name.replace('latest_', ''), ['id'])
+        clean_table = table_name.upper().replace('LATEST_', '')
+        return pk_mapping.get(clean_table, ['EVENT_ID' if 'INTERACTIONS' in clean_table else 'id'])
 
     def remove_duplicate_primary_keys(self, df, table_name):
-        """Remove rows with duplicate primary keys, defaulting to the first column if necessary."""
+        """Remove rows with duplicate primary keys, handling missing keys"""
         try:
             # Get primary keys for the table
             primary_keys = self.get_primary_keys(table_name)
-
-            if not primary_keys:
-                print(f"Warning: No primary keys found or defined for {table_name}. Skipping deduplication.")
-                return df
+            
+            if not primary_keys or primary_keys == ['id']:
+                # For interactions table, use EVENT_ID as primary key
+                if 'EVENT_ID' in df.columns:
+                    primary_keys = ['EVENT_ID']
+                else:
+                    print(f"Warning: No valid primary keys found for {table_name}. Skipping deduplication.")
+                    return df
 
             # Ensure all primary keys exist in the DataFrame
             missing_keys = [key for key in primary_keys if key not in df.columns]
             if missing_keys:
-                print(f"Error: Missing primary keys {missing_keys} in table {table_name}.")
+                print(f"Warning: Missing primary keys {missing_keys} in table {table_name}.")
                 return df
 
+            # Sort by LOADED_AT if exists, keeping most recent
+            if 'LOADED_AT' in df.columns:
+                df['LOADED_AT'] = pd.to_datetime(df['LOADED_AT'], errors='coerce')
+                df = df.sort_values('LOADED_AT', ascending=False)
+
             # Deduplicate based on primary keys
-            if "LOADED_AT" in df.columns:
-                df = df.sort_values(by="LOADED_AT", ascending=False)
-            else:
-                print(f"Warning: No valid date column found for {table_name}. Proceeding without sorting.")
-            df = df.drop_duplicates(subset=primary_keys, keep="first")
+            df = df.drop_duplicates(subset=primary_keys, keep='first')
+            
             return df
         except Exception as e:
             print(f"Error removing duplicate primary keys for {table_name}: {str(e)}")
@@ -177,8 +209,8 @@ class IncrementalETL:
             # Convert DATA_SOURCE to string type explicitly
             if 'DATA_SOURCE' in df.columns:
                 df['DATA_SOURCE'] = df['DATA_SOURCE'].astype(str)
-            
-            # Handle datetime columns
+                
+            # Handle datetime columns before adding metadata
             date_columns = df.select_dtypes(include=['datetime64']).columns
             for col in date_columns:
                 try:
@@ -188,15 +220,15 @@ class IncrementalETL:
                     print(f"Warning: Error converting datetime column {col}: {str(e)}")
             
             # Add metadata columns with explicit types
-            if 'DATA_SOURCE' not in df.columns:
-                df['DATA_SOURCE'] = 'historic'
-            if 'BATCH_ID' not in df.columns:
-                df['BATCH_ID'] = str(self.batch_id)
-            if 'LOADED_AT' not in df.columns:
-                df['LOADED_AT'] = self.batch_timestamp.strftime('%Y-%m-%d %H:%M:%S')
+            df['DATA_SOURCE'] = df.get('DATA_SOURCE', 'historic')
+            df['BATCH_ID'] = df.get('BATCH_ID', str(self.batch_id))
+            df['LOADED_AT'] = df.get('LOADED_AT', self.batch_timestamp.strftime('%Y-%m-%d %H:%M:%S'))
             
             # Handle NA/NaT values
             df = df.replace({pd.NA: None, pd.NaT: None})
+            
+            # Convert types based on expected schema
+            df = self.convert_column_types(df, table_name)
             
             # Remove duplicate rows based on primary keys
             df = self.remove_duplicate_primary_keys(df, table_name)
@@ -412,7 +444,6 @@ class IncrementalETL:
         """Load data to MotherDuck with type handling"""
         try:
             full_table_name = f"ecom_raw.{table_name.lower()}"
-            temp_table_name = f"ecom_raw.temp_{table_name.lower()}"
             
             # Force string types for metadata columns
             metadata_columns = ['DATA_SOURCE', 'BATCH_ID']
@@ -428,23 +459,6 @@ class IncrementalETL:
                     col_type = 'VARCHAR'  # Force VARCHAR for metadata columns
                 column_definitions.append(f'"{col}" {col_type}')
             
-            # Create temporary table
-            create_temp_table_sql = f"""
-            CREATE TABLE {temp_table_name} (
-                {', '.join(column_definitions)}
-            )
-            """
-            
-            # Drop existing temp table if exists
-            self.duck_conn.execute(f"DROP TABLE IF EXISTS {temp_table_name}")
-            
-            # Create new temp table
-            print(f"Creating temp table with columns: {column_definitions}")
-            self.duck_conn.execute(create_temp_table_sql)
-            
-            # Load data into temp table
-            self.duck_conn.execute(f"INSERT INTO {temp_table_name} SELECT * FROM df")
-            
             # Create target table if it doesn't exist
             self.duck_conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS {full_table_name} (
@@ -455,21 +469,25 @@ class IncrementalETL:
             # Get primary keys
             primary_keys = [pk.upper() for pk in self.get_primary_keys(table_name)]
             
+            # Create view of new data
+            self.duck_conn.execute("CREATE TEMPORARY VIEW new_data AS SELECT * FROM df")
+            
             # Delete existing records that will be updated
-            delete_condition = " AND ".join([
-                f"{full_table_name}.\"{pk}\" IN (SELECT \"{pk}\" FROM {temp_table_name})"
-                for pk in primary_keys
-            ])
+            if primary_keys:
+                delete_condition = " AND ".join([
+                    f"{full_table_name}.\"{pk}\" IN (SELECT \"{pk}\" FROM df)"
+                    for pk in primary_keys
+                ])
+                
+                self.duck_conn.execute(f"""
+                    DELETE FROM {full_table_name}
+                    WHERE {delete_condition}
+                """)
             
-            self.duck_conn.execute(f"""
-                DELETE FROM {full_table_name}
-                WHERE {delete_condition}
-            """)
-            
-            # Insert new records
+            # Insert new records directly from DataFrame
             self.duck_conn.execute(f"""
                 INSERT INTO {full_table_name}
-                SELECT * FROM {temp_table_name}
+                SELECT * FROM df
             """)
             
             # Get stats
@@ -477,59 +495,338 @@ class IncrementalETL:
                 SELECT COUNT(*) FROM {full_table_name}
             """).fetchone()[0]
             
-            # Clean up
-            self.duck_conn.execute(f"DROP TABLE IF EXISTS {temp_table_name}")
-            
-            print(f"Successfully loaded data to {full_table_name}:")
+            print(f"Successfully loaded data to MotherDuck {full_table_name}:")
             print(f"- Rows in table: {row_count}")
             
         except Exception as e:
             print(f"Error loading to MotherDuck: {str(e)}")
             raise
 
-    def run_etl(self):
-        """Execute ETL process"""
+    def load_to_duckdb(self, df, table_name):
+        """Load data to local DuckDB with consistent type handling"""
         try:
-            print("\nStarting ETL process...")
+            full_table_name = f"ecom_raw.{table_name.lower()}"
+            
+            # Force all ID columns to VARCHAR/string type
+            for col in df.columns:
+                if col.upper().endswith('_ID'):
+                    df[col] = df[col].astype(str)
+            
+            # Force string types for metadata columns
+            metadata_columns = ['DATA_SOURCE', 'BATCH_ID']
+            for col in metadata_columns:
+                if col in df.columns:
+                    df[col] = df[col].astype(str)
+            
+            # Get column definitions with explicit types
+            column_definitions = []
+            for col, dtype in df.dtypes.items():
+                col_type = self.get_duck_type(dtype, col)
+                if col.upper().endswith('_ID') or col in metadata_columns:
+                    col_type = 'VARCHAR'  # Force VARCHAR for ID and metadata columns
+                column_definitions.append(f'"{col}" {col_type}')
+            
+            # Create target table if it doesn't exist
+            create_table_sql = f"""
+                CREATE TABLE IF NOT EXISTS {full_table_name} (
+                    {', '.join(column_definitions)}
+                )
+            """
+            self.duck_conn.execute(create_table_sql)
+            
+            # Get primary keys
+            primary_keys = [pk.upper() for pk in self.get_primary_keys(table_name)]
+            
+            # Create temporary table for new data with same schema
+            temp_table_name = f"temp_{table_name.lower()}"
+            self.duck_conn.execute(f"DROP TABLE IF EXISTS {temp_table_name}")
+            self.duck_conn.execute(f"""
+                CREATE TEMPORARY TABLE {temp_table_name} AS 
+                SELECT * FROM {full_table_name} WHERE 1=0
+            """)
+            
+            # Insert data into temporary table
+            self.duck_conn.execute(f"""
+                INSERT INTO {temp_table_name}
+                SELECT * FROM df
+            """)
+            
+            # Delete existing records that will be updated
+            if primary_keys:
+                pk_conditions = []
+                for pk in primary_keys:
+                    pk_conditions.append(
+                        f"{full_table_name}.\"{pk}\"::VARCHAR IN (SELECT \"{pk}\"::VARCHAR FROM {temp_table_name})"
+                    )
+                delete_condition = " AND ".join(pk_conditions)
+                
+                self.duck_conn.execute(f"""
+                    DELETE FROM {full_table_name}
+                    WHERE {delete_condition}
+                """)
+            
+            # Insert new records from temporary table
+            self.duck_conn.execute(f"""
+                INSERT INTO {full_table_name}
+                SELECT * FROM {temp_table_name}
+            """)
+            
+            # Clean up temporary table
+            self.duck_conn.execute(f"DROP TABLE IF EXISTS {temp_table_name}")
+            
+            # Get stats
+            row_count = self.duck_conn.execute(f"""
+                SELECT COUNT(*) FROM {full_table_name}
+            """).fetchone()[0]
+            
+            print(f"Successfully loaded data to local DuckDB {full_table_name}:")
+            print(f"- Rows in table: {row_count}")
+            
+            return full_table_name
+            
+        except Exception as e:
+            print(f"Error loading to DuckDB: {str(e)}")
+            raise
+
+    def cleanup_temp_tables(self):
+        """Clean up any temporary tables that might exist"""
+        try:
+            # Get list of temporary tables
+            temp_tables = self.duck_conn.execute("""
+                SELECT table_name 
+                FROM information_schema.tables 
+                WHERE table_schema = 'ecom_raw' 
+                AND table_name LIKE 'temp_%'
+            """).fetchall()
+            
+            # Drop each temporary table
+            for table in temp_tables:
+                self.duck_conn.execute(f"DROP TABLE IF EXISTS ecom_raw.{table[0]}")
+                print(f"Dropped temporary table: {table[0]}")
+                
+        except Exception as e:
+            print(f"Error cleaning up temporary tables: {str(e)}")
+
+    def sync_to_motherduck(self, table_name):
+        """Sync local DuckDB table to MotherDuck with improved cross-database query handling"""
+        try:
+            full_table_name = f"ecom_raw.{table_name.lower()}"
+            
+            # Get the schema from local DuckDB
+            schema_query = f"""
+            SELECT column_name, data_type 
+            FROM information_schema.columns 
+            WHERE table_name = '{table_name.lower()}'
+            AND table_schema = 'ecom_raw'
+            ORDER BY ordinal_position
+            """
+            columns = self.duck_conn.execute(schema_query).fetchall()
+            
+            # Build CREATE TABLE statement
+            column_definitions = [f'"{col[0]}" {col[1]}' for col in columns]
+            create_table_sql = f"""
+            CREATE TABLE IF NOT EXISTS {full_table_name} (
+                {', '.join(column_definitions)}
+            )
+            """
+            
+            # Create table in MotherDuck
+            self.md_conn.execute(create_table_sql)
+            
+            # Get row count from local table
+            local_count = self.duck_conn.execute(f"SELECT COUNT(*) FROM {full_table_name}").fetchone()[0]
+            
+            if local_count > 0:
+                # Get primary keys
+                primary_keys = [pk.upper() for pk in self.get_primary_keys(table_name)]
+                
+                # Get the data from local DuckDB as a DataFrame
+                local_data = self.duck_conn.execute(f"SELECT * FROM {full_table_name}").df()
+                
+                # If table has primary keys, use merge approach
+                if primary_keys:
+                    # Create temporary table in MotherDuck
+                    temp_table = f"temp_{table_name.lower()}"
+                    self.md_conn.execute(f"DROP TABLE IF EXISTS {temp_table}")
+                    
+                    # Create temp table with same schema
+                    self.md_conn.execute(f"""
+                        CREATE TEMPORARY TABLE {temp_table} (
+                            {', '.join(column_definitions)}
+                        )
+                    """)
+                    
+                    # Insert data into temp table using DataFrame
+                    self.md_conn.execute(f"INSERT INTO {temp_table} SELECT * FROM local_data")
+                    
+                    # Delete existing records that will be updated
+                    pk_conditions = []
+                    for pk in primary_keys:
+                        pk_conditions.append(
+                            f"target.\"{pk}\"::VARCHAR IN (SELECT \"{pk}\"::VARCHAR FROM {temp_table})"
+                        )
+                    delete_condition = " AND ".join(pk_conditions)
+                    
+                    self.md_conn.execute(f"""
+                        DELETE FROM {full_table_name} target
+                        WHERE {delete_condition}
+                    """)
+                    
+                    # Insert new records
+                    self.md_conn.execute(f"""
+                        INSERT INTO {full_table_name}
+                        SELECT * FROM {temp_table}
+                    """)
+                    
+                    # Clean up temp table
+                    self.md_conn.execute(f"DROP TABLE IF EXISTS {temp_table}")
+                
+                else:
+                    # For tables without primary keys, just append using DataFrame
+                    self.md_conn.execute(f"INSERT INTO {full_table_name} SELECT * FROM local_data")
+            
+            # Verify row count
+            md_count = self.md_conn.execute(f"SELECT COUNT(*) FROM {full_table_name}").fetchone()[0]
+            
+            print(f"Successfully synced to MotherDuck {full_table_name}:")
+            print(f"- Local rows: {local_count}")
+            print(f"- MotherDuck rows: {md_count}")
+            
+            if local_count != md_count:
+                print(f"Warning: Row count mismatch between local ({local_count}) and MotherDuck ({md_count})")
+            
+        except Exception as e:
+            print(f"Error syncing to MotherDuck: {str(e)}")
+            print("Full error details:")
+            import traceback
+            print(traceback.format_exc())
+            raise
+
+    def reset_motherduck_database(self):
+        """Delete and recreate the MotherDuck database"""
+        try:
+            # First connect without database to drop/create it
+            print("\nResetting MotherDuck database...")
+            connection_string = f"md:?motherduck_token={self.motherduck_token}"
+            temp_conn = duckdb.connect(connection_string)
+            
+            try:
+                # Drop database if exists
+                temp_conn.execute("DROP DATABASE IF EXISTS ecom_db")
+                print("Existing database dropped successfully")
+                
+                # Create fresh database
+                temp_conn.execute("CREATE DATABASE ecom_db")
+                print("New database created successfully")
+                
+            finally:
+                temp_conn.close()
+            
+            # Connect to new database
+            connection_string = f"md:ecom_db?motherduck_token={self.motherduck_token}"
+            self.md_conn = duckdb.connect(connection_string)
+            
+            # Create schema
+            self.md_conn.execute("CREATE SCHEMA IF NOT EXISTS ecom_raw")
+            print("Schema created successfully")
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error resetting MotherDuck database: {str(e)}")
+            raise
+
+    def reset_local_duckdb(self):
+        """Reset local DuckDB database"""
+        try:
+            print("\nResetting local DuckDB...")
+            
+            # Ensure existing connection is closed
+            if hasattr(self, 'duck_conn'):
+                self.duck_conn.close()
+
+            
+            # Try to remove the file, with error handling
+            try:
+                if os.path.exists('ecom_db'):
+                    os.remove('ecom_db')
+                    print("Existing local database file removed")
+            except PermissionError:
+                print("Could not remove ecom_db. Attempting alternative cleanup.")
+                
+                # Alternative approach: use duckdb to detach and remove
+                try:
+                    # Forcefully close any existing connections
+                    duckdb.close_all_connections()
+                    
+                    # Wait a moment to ensure connections are closed
+                    import time
+                    time.sleep(1)
+                    
+                    # Try removing again
+                    if os.path.exists('ecom_db'):
+                        os.remove('ecom_db')
+                        print("Database file removed successfully after connection closure")
+                except Exception as e:
+                    print(f"Failed to remove database file: {e}")
+                    raise
+            
+            # Create fresh connection
+            self.duck_conn = duckdb.connect('ecom_db')
+            
+            # Create schema
+            self.duck_conn.execute("CREATE SCHEMA IF NOT EXISTS ecom_raw")
+            print("Local database reset successfully")
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error resetting local DuckDB: {str(e)}")
+            raise
+
+    def run_etl(self):
+        """Execute ETL process with database reset"""
+        try:
+            print("\nStarting ETL process with database reset...")
+            
+            # Reset both databases
+            self.reset_local_duckdb()
+            self.reset_motherduck_database()
             
             for table in self.postgres_tables + self.s3_tables:
                 print(f"\nProcessing {table}")
                 
                 try:
-                    # Extract historic data from S3 CSV
+                    # Extract data
                     historic_df = self.extract_historic_from_s3(table)
-                    
-                    # Extract latest data from original sources
                     latest_df = (self.extract_latest_from_s3(table)
                             if table in self.s3_tables 
                             else self.extract_latest_from_postgres(table))
                     
-                    # Transform each dataset separately first
+                    # Transform data
                     historic_df = self.transform_data(historic_df, f"{table}")
                     latest_df = self.transform_data(latest_df, f"latest_{table}")
                     
-                    # Ensure columns match before concatenation
+                    # Combine datasets
                     all_columns = list(set(historic_df.columns) | set(latest_df.columns))
-                    
-                    # Add missing columns with NULL values
                     for col in all_columns:
                         if col not in historic_df.columns:
                             historic_df[col] = None
                         if col not in latest_df.columns:
                             latest_df[col] = None
                     
-                    # Reorder columns to match
                     historic_df = historic_df[all_columns]
                     latest_df = latest_df[all_columns]
                     
-                    # Combine datasets
                     combined_df = pd.concat([historic_df, latest_df], ignore_index=True)
-                    
-                    # Final transformation on combined data
                     transformed_df = self.transform_data(combined_df, table)
                     
-                    # Load to MotherDuck
-                    self.load_to_motherduck(transformed_df, table)
+                    # Load data
+                    print(f"\nLoading {table} to databases...")
+                    self.load_to_duckdb(transformed_df, table)
+                    self.sync_to_motherduck(table)
+                    
+                    print(f"Successfully processed {table}")
                     
                 except Exception as e:
                     print(f"Error processing table {table}: {str(e)}")
@@ -539,8 +836,12 @@ class IncrementalETL:
             print(f"ETL process error: {str(e)}")
             raise
         finally:
-            self.duck_conn.close()
-            print("\nETL process completed. Connections closed.")
+            # Clean up connections
+            if hasattr(self, 'duck_conn'):
+                self.duck_conn.close()
+            if hasattr(self, 'md_conn'):
+                self.md_conn.close()
+            print("\nETL process completed. All connections closed.")
             
 if __name__ == "__main__":
     try:

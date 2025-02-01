@@ -12,7 +12,7 @@ services:
     volumes:
       - postgres_db_source_data:/var/lib/postgresql/data
     networks:
-      - ecom-airflow_20dd52_airflow
+      - ecom-airflow_c3a8ce_airflow
 
   pgadmin:
     container_name: pgadmin4_container
@@ -29,12 +29,12 @@ services:
     depends_on:
       - db
     networks:
-      - ecom-airflow_20dd52_airflow
+      - ecom-airflow_c3a8ce_airflow
 
 volumes:
   postgres_db_source_data:
   pgadmin_data:
 
 networks:
-  ecom-airflow_20dd52_airflow:
+  ecom-airflow_c3a8ce_airflow:
     external: true
