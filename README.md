@@ -48,7 +48,7 @@ The processed and aggregated data is served to different downstream systems:
 
 
 See resources:
-- [Demo video]()
+- [YouTube TagLish Tutorial](https://www.youtube.com/watch?v=0mLDpzMa45o&t=7s)
 - [Documentation](https://medium.com/@sclauguico/migrate-from-snowflake-to-duckdb-and-motherduck-a-guide-for-an-ecommerce-end-to-end-data-41fadae1da1b)
 
 This project has been inspired by:
